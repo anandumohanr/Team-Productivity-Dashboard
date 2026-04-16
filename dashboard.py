@@ -311,9 +311,13 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
 .stApp { background-color: #f8fafc !important; }
 .main .block-container { padding: 1.5rem 2rem 3rem !important; max-width: 100% !important; }
 
-/* Hide Streamlit chrome */
-#MainMenu, footer { visibility: hidden !important; }
-[data-testid="stToolbar"] { display: none !important; }
+/* Hide Streamlit chrome — use display:none so they take no space */
+header[data-testid="stHeader"],
+#MainMenu, footer,
+[data-testid="stToolbar"],
+[data-testid="stStatusWidget"] { display: none !important; }
+/* Remove the top padding Streamlit adds to clear its header */
+.stMainBlockContainer { padding-top: 0 !important; }
 
 /* Headings */
 h1 { font-size: 22px !important; font-weight: 700 !important; color: #0f172a !important; }
@@ -373,29 +377,19 @@ hr { border-color: #e2e8f0 !important; margin: 1.5rem 0 !important; }
 /* Spinner */
 .stSpinner > div { border-top-color: #6366f1 !important; }
 
+/* Zero out the markdown wrapper that holds the hidden sticky marker */
+.stMarkdownContainer:has(#_sticky_marker) {
+    margin: 0 !important; padding: 0 !important;
+    height: 0 !important; line-height: 0 !important;
+    overflow: hidden !important;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: #f1f5f9; }
 ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
 
-/* ── Sticky control bar (CSS path) ─────────────────────────────────────── */
-/* Two selectors cover both known Streamlit DOM layouts:
-   Layout A (1.32–1.35):  .block-container > stVerticalBlock > stVBBW:first-child
-   Layout B (some builds): .block-container > div > stVerticalBlock > stVBBW:first-child
-   JS below handles anything else as a fallback. */
-.block-container > [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlockBorderWrapper"]:first-child,
-.block-container > div > [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlockBorderWrapper"]:first-child {
-    position: sticky !important;
-    top: 0 !important;
-    z-index: 200 !important;
-    background: rgba(248,250,252,0.96) !important;
-    backdrop-filter: blur(8px) !important;
-    -webkit-backdrop-filter: blur(8px) !important;
-    box-shadow: 0 2px 10px rgba(15,23,42,.08) !important;
-    padding-bottom: 10px !important;
-    margin-bottom: 4px !important;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -888,68 +882,24 @@ def main():
     ist = pytz.timezone("Asia/Kolkata")
     today = datetime.now(ist).date()
 
-    # ── Title (scrolls away — not sticky) ──────────────────────────────
+    # ── Header ──────────────────────────────────────────────────────────
     st.markdown("""
-    <div style="display:flex;align-items:center;gap:14px;padding:8px 0 4px">
-      <div style="width:42px;height:42px;background:linear-gradient(135deg,#6366f1,#8b5cf6);
-                  border-radius:10px;display:flex;align-items:center;justify-content:center;
-                  font-size:20px;flex-shrink:0;">📊</div>
-      <div>
-        <div style="font-size:22px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;
-                    line-height:1.2">Team Productivity Dashboard</div>
-        <div style="font-size:12px;color:#64748b;margin-top:2px">
-          Engineering team metrics &amp; quality tracking
-        </div>
-      </div>
+<div style="display:flex;align-items:center;gap:14px;padding:8px 0 4px">
+  <div style="width:42px;height:42px;background:linear-gradient(135deg,#6366f1,#8b5cf6);
+              border-radius:10px;display:flex;align-items:center;justify-content:center;
+              font-size:20px;flex-shrink:0;">📊</div>
+  <div>
+    <div style="font-size:22px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;
+                line-height:1.2">Team Productivity Dashboard</div>
+    <div style="font-size:12px;color:#64748b;margin-top:2px">
+      Engineering team metrics &amp; quality tracking
     </div>
-    """, unsafe_allow_html=True)
-
-    # ── Sticky control bar ──────────────────────────────────────────────
-    # Everything inside this container becomes the first top-level block,
-    # which is targeted by the sticky CSS rule.
-    with st.container():
-        # JS fallback: walks the DOM from a marker element to find the correct
-        # ancestor regardless of Streamlit's internal div structure.
-        # Strategy: find .block-container, then take the grandchild that
-        # contains the marker — that is always the stVerticalBlockBorderWrapper
-        # (or equivalent in future versions).
-        st.markdown("""
-<div id="_sticky_marker" style="display:none;height:0;overflow:hidden"></div>
-<script>
-(function () {
-  var STICKY_STYLES = {
-    position: 'sticky', top: '0', zIndex: '200',
-    background: 'rgba(248,250,252,0.96)',
-    backdropFilter: 'blur(8px)', webkitBackdropFilter: 'blur(8px)',
-    boxShadow: '0 2px 10px rgba(15,23,42,.08)', paddingBottom: '10px'
-  };
-  function applySticky() {
-    var marker = document.getElementById('_sticky_marker');
-    if (!marker) return false;
-    // Walk up to find .block-container
-    var bc = marker;
-    while (bc && !(bc.classList && bc.classList.contains('block-container')))
-      bc = bc.parentElement;
-    if (!bc) return false;
-    // Find the direct child of bc that contains the marker
-    var child = marker;
-    while (child && child.parentElement !== bc) child = child.parentElement;
-    if (!child) return false;
-    // Find the grandchild of bc (child of that child) containing the marker
-    var grandchild = marker;
-    while (grandchild && grandchild.parentElement !== child) grandchild = grandchild.parentElement;
-    if (!grandchild) return false;
-    // grandchild is the stVerticalBlockBorderWrapper (or equivalent) — make it sticky
-    Object.assign(grandchild.style, STICKY_STYLES);
-    return true;
-  }
-  if (!applySticky()) {
-    setTimeout(function () { if (!applySticky()) setTimeout(applySticky, 500); }, 80);
-  }
-})();
-</script>
+  </div>
+</div>
 """, unsafe_allow_html=True)
 
+    # ── Controls ────────────────────────────────────────────────────────
+    with st.container():
         period_types = [
             "This Week", "This Month", "Last Month",
             "This Quarter", "Last Quarter", "Custom",
@@ -985,7 +935,6 @@ def main():
                 unsafe_allow_html=True,
             )
 
-        # Custom date pickers live inside the sticky bar too
         if period_type == "Custom":
             c1, c2, _ = st.columns([2, 2, 2])
             with c1:
