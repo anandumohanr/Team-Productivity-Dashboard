@@ -808,8 +808,6 @@ function copyReport(btn) {{
 </script>
 """, height=52)
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown(report_html, unsafe_allow_html=True)
 
 
 # =====================
@@ -968,33 +966,35 @@ def main():
     curr_team, curr_dev = compute_metrics(df, bugs_df, start_date, end_date)
     prev_team, prev_dev = compute_metrics(df, bugs_df, prev_start, prev_end)
 
+    DIVIDER = "<div style='height:1px;background:linear-gradient(90deg,#6366f1,transparent);margin:20px 0'></div>"
+
     # ── Section 1: Team KPI cards ────────────────────────────────────────
     _section_header("Team Overview", period_label)
     render_kpi_cards(curr_team, prev_team)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(DIVIDER, unsafe_allow_html=True)
 
     # ── Section 2: Developer breakdown ───────────────────────────────────
     _section_header("Developer Breakdown", "Individual performance metrics")
     render_dev_table(curr_dev, prev_dev)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(DIVIDER, unsafe_allow_html=True)
 
     # ── Section 2b: Developer drill-down ─────────────────────────────────
     with st.expander("Developer Drill-Down", expanded=False):
         render_dev_drilldown(df, bugs_df, curr_dev, prev_dev, start_date, end_date)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(DIVIDER, unsafe_allow_html=True)
 
-    # ── Share / Export ───────────────────────────────────────────────────
-    st.markdown("<div style='height:1px;background:linear-gradient(90deg,#6366f1,transparent);margin:8px 0 20px'></div>", unsafe_allow_html=True)
+    # ── Raw tasks (collapsed) ────────────────────────────────────────────
+    render_raw_data(df, bugs_df, start_date, end_date)
+
+    # ── Share Report ─────────────────────────────────────────────────────
+    st.markdown(DIVIDER, unsafe_allow_html=True)
     _section_header("Share Report", "Copy Outlook-ready summary to clipboard")
     st.markdown("<p style='font-size:12px;color:#64748b;margin-top:-8px;margin-bottom:12px'>Click the button below to copy the formatted table — paste directly into Outlook or any email client.</p>", unsafe_allow_html=True)
 
     render_share_section(period_label, curr_team, curr_dev)
-
-    # ── Section 4: Raw tasks (collapsed) ────────────────────────────────
-    render_raw_data(df, bugs_df, start_date, end_date)
 
 
 if __name__ == "__main__":
