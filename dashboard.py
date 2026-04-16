@@ -1,12 +1,10 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
-import numpy as np
 import requests
 from datetime import datetime, timedelta, date
 import altair as alt
 import pytz
-import time
 import unicodedata
 import re
 from requests.auth import HTTPBasicAuth
@@ -255,7 +253,6 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
 
     dev_rows = []
     for dev in all_devs:
-        dev_tasks = in_period[in_period["Developer"] == dev]
         dev_completed = completed[completed["Developer"] == dev]
         dev_bugs = bugs_in_period[bugs_in_period["Developer"] == dev] if not bugs_in_period.empty else empty_bugs
 
@@ -263,8 +260,13 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
         bug_count = len(dev_bugs)
 
         productivity_pct = round(completed_sp / expected_sp_per_dev * 100, 1)
-        bug_density = bug_count / completed_sp if completed_sp > 0 else 0.0
-        quality_score = int(max(0, min(100, round(100 - bug_density * 200))))
+        if completed_sp > 0:
+            bug_density = bug_count / completed_sp
+            quality_score = int(max(0, min(100, round(100 - bug_density * 200))))
+        elif bug_count > 0:
+            quality_score = 0   # bugs with no output → worst score
+        else:
+            quality_score = 100  # no bugs, no output → neutral
 
         dev_rows.append({
             "Developer": dev,
@@ -283,8 +285,13 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
     team_expected_sp = expected_sp_per_dev * n_devs
     team_productivity = round(team_completed_sp / team_expected_sp * 100, 1)
     total_bugs = len(bugs_in_period)
-    team_bug_density = total_bugs / team_completed_sp if team_completed_sp > 0 else 0.0
-    team_quality = int(max(0, min(100, round(100 - team_bug_density * 200))))
+    if team_completed_sp > 0:
+        team_bug_density = total_bugs / team_completed_sp
+        team_quality = int(max(0, min(100, round(100 - team_bug_density * 200))))
+    elif total_bugs > 0:
+        team_quality = 0
+    else:
+        team_quality = 100
 
     team_metrics = {
         "Completed SP": team_completed_sp,
@@ -376,13 +383,6 @@ hr { border-color: #e2e8f0 !important; margin: 1.5rem 0 !important; }
 
 /* Spinner */
 .stSpinner > div { border-top-color: #6366f1 !important; }
-
-/* Zero out the markdown wrapper that holds the hidden sticky marker */
-.stMarkdownContainer:has(#_sticky_marker) {
-    margin: 0 !important; padding: 0 !important;
-    height: 0 !important; line-height: 0 !important;
-    overflow: hidden !important;
-}
 
 /* Scrollbar */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
