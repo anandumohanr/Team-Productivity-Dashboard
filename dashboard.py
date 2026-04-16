@@ -953,8 +953,6 @@ def main():
         start_date, end_date, prev_start, prev_end = get_period_bounds(period_type, today)
         period_label = f"{period_type} ({start_date.strftime('%d %b')} – {end_date.strftime('%d %b %Y')})"
 
-    prev_label = f"{prev_start.strftime('%d %b')} – {prev_end.strftime('%d %b %Y')}"
-
     st.markdown("<div style='height:1px;background:linear-gradient(90deg,#6366f1,transparent);margin:12px 0 20px'></div>", unsafe_allow_html=True)
 
     # ── Load data ───────────────────────────────────────────────────────
@@ -971,13 +969,13 @@ def main():
     prev_team, prev_dev = compute_metrics(df, bugs_df, prev_start, prev_end)
 
     # ── Section 1: Team KPI cards ────────────────────────────────────────
-    _section_header("Team Overview", f"{period_label}  ·  vs {prev_label}")
+    _section_header("Team Overview", period_label)
     render_kpi_cards(curr_team, prev_team)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Section 2: Developer breakdown ───────────────────────────────────
-    _section_header("Developer Breakdown", f"Individual performance  ·  vs {prev_label}")
+    _section_header("Developer Breakdown", "Individual performance metrics")
     render_dev_table(curr_dev, prev_dev)
 
     st.markdown("<br>", unsafe_allow_html=True)
