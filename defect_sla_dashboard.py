@@ -551,13 +551,20 @@ def _inject_css() -> None:
 html, body, [class*="css"] {{ font-family: 'Inter', sans-serif !important; }}
 
 .stApp {{ background-color: {COLOR["page_bg"]} !important; }}
-.main .block-container {{ padding: 1.5rem 2rem 3rem !important; max-width: 100% !important; }}
+.main .block-container,
+[data-testid="stAppViewBlockContainer"],
+[data-testid="stMainBlockContainer"],
+.stMainBlockContainer {{
+    padding: 0.5rem 2rem 3rem !important;
+    max-width: 100% !important;
+}}
 
 header[data-testid="stHeader"],
 #MainMenu, footer,
 [data-testid="stToolbar"],
-[data-testid="stStatusWidget"] {{ display: none !important; }}
-.stMainBlockContainer {{ padding-top: 0 !important; }}
+[data-testid="stStatusWidget"],
+[data-testid="stDecoration"] {{ display: none !important; }}
+[data-testid="stAppViewContainer"] > .main {{ padding-top: 0 !important; }}
 
 h1 {{ font-size: 22px !important; font-weight: 700 !important; color: {COLOR["text_primary"]} !important; }}
 h2, h3 {{ color: {COLOR["text_primary"]} !important; }}
