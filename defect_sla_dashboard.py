@@ -214,6 +214,15 @@ def _normalize_developer(dev_field: Any, assignee_field: Any) -> str:
     return "Unassigned"
 
 
+def _assignee_name(assignee_field: Any) -> str:
+    """Plain Jira assignee displayName, or 'Unassigned'."""
+    if isinstance(assignee_field, dict):
+        name = assignee_field.get("displayName") or assignee_field.get("name") or ""
+        if name:
+            return name
+    return "Unassigned"
+
+
 def _normalize_priority(priority_field: Any) -> str:
     """Extract P0/P1/P2/P3 from various Jira priority representations."""
     if not priority_field:
@@ -341,6 +350,7 @@ def load_defect_data() -> tuple[pd.DataFrame, datetime]:
             "developer": _normalize_developer(
                 f.get("customfield_11012"), f.get("assignee"),
             ),
+            "assignee": _assignee_name(f.get("assignee")),
             "description_text": _adf_to_text(f.get("description")),
             "labels": f.get("labels") or [],
             "components": component_names,
@@ -1153,6 +1163,30 @@ def _render_median_resolution(closed_recent_df: pd.DataFrame) -> None:
 """, unsafe_allow_html=True)
 
 
+STATUS_STYLE_RULES: list[tuple[tuple[str, ...], tuple[str, str]]] = [
+    (("closed", "done", "resolved", "fixed", "released"),  ("#dcfce7", "#15803d")),
+    (("in progress", "in development", "development", "coding", "working"),
+                                                            ("#dbeafe", "#1d4ed8")),
+    (("review", "code review", "peer review"),             ("#ede9fe", "#6d28d9")),
+    (("qa", "testing", "ready for qa", "in qa", "verification"),
+                                                            ("#fef3c7", "#b45309")),
+    (("blocked", "on hold", "waiting", "pending"),         ("#fee2e2", "#b91c1c")),
+    (("open", "to do", "backlog", "new", "created", "reopened"),
+                                                            ("#e0e7ef", "#334155")),
+]
+
+
+def _status_style(status: str) -> tuple[str, str]:
+    """Return (bg, fg) for a status name. Falls back to neutral grey-blue."""
+    s = (status or "").strip().lower()
+    if not s:
+        return ("#f1f5f9", "#64748b")
+    for keywords, colors in STATUS_STYLE_RULES:
+        if any(k in s for k in keywords):
+            return colors
+    return ("#e0e7ef", "#334155")
+
+
 def _pill(text: str, bg: str, fg: str, mono: bool = False) -> str:
     fam = "font-family:ui-monospace,SFMono-Regular,monospace;" if mono else ""
     return (
@@ -1248,7 +1282,7 @@ def _render_ticket_table(open_df: pd.DataFrame, jira_domain: str) -> None:
         type_color = COLOR["text_primary"] if r["type"] else COLOR["text_tertiary"]
 
         summary = r["summary"] or ""
-        summary_short = summary if len(summary) <= 70 else summary[:67] + "…"
+        summary_short = summary if len(summary) <= 110 else summary[:107] + "…"
         summary_esc = summary.replace('"', "&quot;")
 
         age_days = r["age_days"]
@@ -1257,39 +1291,26 @@ def _render_ticket_table(open_df: pd.DataFrame, jira_domain: str) -> None:
         else:
             age_str = f"{age_days:.0f}d"
 
+        status_bg, status_fg = _status_style(r["status"])
         status_html = (
-            f'<span style="font-size:11px;color:{COLOR["text_tertiary"]};'
-            f'text-transform:uppercase;letter-spacing:.05em">{r["status"]}</span>'
+            f'<span style="background:{status_bg};color:{status_fg};padding:2px 8px;'
+            f'border-radius:10px;font-size:11px;font-weight:600;white-space:nowrap">'
+            f'{r["status"]}</span>'
         )
 
         pct = r["sla_pct"]
         if label == "breached":
-            sla_clr = COLOR["red_fill"]
-            sla_text = f"● {pct}% over"
+            sla_bg, sla_fg, sla_text = "#fee2e2", "#b91c1c", f"{pct}% over"
         elif label == "at_risk":
-            sla_clr = COLOR["amber_fill"]
-            sla_text = f"● {pct}% used"
+            sla_bg, sla_fg, sla_text = "#fef3c7", "#b45309", f"{pct}% used"
         elif label == "on_track":
-            sla_clr = COLOR["green_fill"]
-            sla_text = f"● {pct}% used"
+            sla_bg, sla_fg, sla_text = "#dcfce7", "#15803d", f"{pct}% used"
         else:
-            sla_clr = COLOR["text_tertiary"]
-            sla_text = "—"
-
-        bar_fill_pct = min(pct, 100)
-        if label == "breached":
-            bar_clr = COLOR["red_fill"]
-        elif label == "at_risk":
-            bar_clr = COLOR["amber_fill"]
-        else:
-            bar_clr = COLOR["green_fill"]
-        sla_bar = (
-            f'<div style="display:flex;align-items:center;gap:8px;min-width:140px">'
-            f'<div style="flex:1;background:#e2e8f0;border-radius:3px;height:4px;min-width:60px">'
-            f'<div style="width:{bar_fill_pct}%;background:{bar_clr};height:4px;border-radius:3px"></div>'
-            f'</div>'
-            f'<span style="font-size:11px;font-weight:700;color:{sla_clr};white-space:nowrap">{sla_text}</span>'
-            f'</div>'
+            sla_bg, sla_fg, sla_text = "#f1f5f9", "#64748b", "—"
+        sla_html = (
+            f'<span style="background:{sla_bg};color:{sla_fg};padding:2px 10px;'
+            f'border-radius:10px;font-size:11px;font-weight:700;white-space:nowrap">'
+            f'{sla_text}</span>'
         )
 
         key_link = (
@@ -1301,15 +1322,17 @@ def _render_ticket_table(open_df: pd.DataFrame, jira_domain: str) -> None:
 
         rows_html += (
             f'<tr>'
-            f'<td style="{td}">{key_link}</td>'
-            f'<td style="{td};max-width:340px" title="{summary_esc}">{summary_short}</td>'
-            f'<td style="{td}">{pri_pill}</td>'
-            f'<td style="{td};font-size:12px">{client_html}</td>'
-            f'<td style="{td};color:{type_color};font-size:12px">{type_val}</td>'
-            f'<td style="{td};font-size:12px">{r["developer"]}</td>'
-            f'<td style="{td}">{status_html}</td>'
-            f'<td style="{td};font-size:12px;color:{COLOR["text_secondary"]}">{age_str}</td>'
-            f'<td style="{td}">{sla_bar}</td>'
+            f'<td style="{td};white-space:nowrap">{key_link}</td>'
+            f'<td style="{td};min-width:320px;max-width:520px;line-height:1.4" '
+            f'title="{summary_esc}">{summary_short}</td>'
+            f'<td style="{td};white-space:nowrap">{pri_pill}</td>'
+            f'<td style="{td};font-size:12px;white-space:nowrap">{client_html}</td>'
+            f'<td style="{td};color:{type_color};font-size:12px;white-space:nowrap">{type_val}</td>'
+            f'<td style="{td};font-size:12px;white-space:nowrap">{r["developer"]}</td>'
+            f'<td style="{td};font-size:12px;white-space:nowrap">{r["assignee"]}</td>'
+            f'<td style="{td};white-space:nowrap">{status_html}</td>'
+            f'<td style="{td};font-size:12px;color:{COLOR["text_secondary"]};white-space:nowrap">{age_str}</td>'
+            f'<td style="{td};white-space:nowrap">{sla_html}</td>'
             f'</tr>'
         )
 
@@ -1320,11 +1343,12 @@ def _render_ticket_table(open_df: pd.DataFrame, jira_domain: str) -> None:
     <thead>
       <tr>
         <th style="{th}">Key</th>
-        <th style="{th}">Summary</th>
+        <th style="{th};width:100%">Summary</th>
         <th style="{th}">Pri</th>
         <th style="{th}">Client</th>
         <th style="{th}">Type</th>
         <th style="{th}">Developer</th>
+        <th style="{th}">Assignee</th>
         <th style="{th}">Status</th>
         <th style="{th}">Age</th>
         <th style="{th}">SLA</th>
@@ -1581,7 +1605,7 @@ def _render_raw_expander(df: pd.DataFrame, filtered_view: pd.DataFrame) -> None:
         )
         display_cols = [
             "key", "summary", "priority", "status", "client", "extraction_source",
-            "developer", "type", "created", "age_days",
+            "developer", "assignee", "type", "created", "age_days",
             "sla_pct", "sla_label", "sla_elapsed", "sla_budget", "sla_unit",
         ]
         present = [c for c in display_cols if c in df.columns]
