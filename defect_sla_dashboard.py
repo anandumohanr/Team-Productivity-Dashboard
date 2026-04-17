@@ -577,6 +577,19 @@ h2, h3 {{ color: {COLOR["text_primary"]} !important; }}
 }}
 .stButton > button:hover {{ background: #4f46e5 !important; }}
 
+/* Fresh-chip uses a distinctive teal so it stands out from the palette reds/ambers */
+.st-key-chip_fresh .stButton > button {{
+    background: #0e7490 !important;
+    color: #fff !important;
+    border: 1px solid #0e7490 !important;
+}}
+.st-key-chip_fresh .stButton > button:hover {{ background: #155e75 !important; }}
+.st-key-chip_fresh .stButton > button[kind="primary"] {{
+    background: #0891b2 !important;
+    border-color: #0891b2 !important;
+    box-shadow: 0 0 0 2px rgba(8,145,178,.25) !important;
+}}
+
 [data-testid="stSelectbox"] > div > div {{
     background: {COLOR["card_bg"]} !important; border: 1px solid {COLOR["border"]} !important;
     border-radius: 6px !important; color: {COLOR["text_primary"]} !important;
@@ -1205,12 +1218,18 @@ def _pill(text: str, bg: str, fg: str, mono: bool = False) -> str:
 def _render_chip_filters(open_df: pd.DataFrame) -> str:
     """Filter chips; returns the active chip key."""
     n_all = len(open_df)
+    yesterday = datetime.now(IST).date() - timedelta(days=1)
+    if open_df.empty:
+        n_fresh = 0
+    else:
+        n_fresh = int((open_df["created"].dt.date >= yesterday).sum())
     n_breach = int((open_df["sla_label"] == "breached").sum())
     n_risk = int((open_df["sla_label"] == "at_risk").sum())
     n_p0 = int((open_df["priority"] == "P0").sum())
 
     chips = [
         ("all",      f"All ({n_all})"),
+        ("fresh",    f"🆕 Today + Yesterday ({n_fresh})"),
         ("breached", f"Breached ({n_breach})"),
         ("at_risk",  f"At risk ({n_risk})"),
         ("p0",       f"P0 ({n_p0})"),
@@ -1232,6 +1251,11 @@ def _render_chip_filters(open_df: pd.DataFrame) -> str:
 
 
 def _apply_chip_filter(df: pd.DataFrame, chip: str) -> pd.DataFrame:
+    if chip == "fresh":
+        if df.empty:
+            return df
+        yesterday = datetime.now(IST).date() - timedelta(days=1)
+        return df[df["created"].dt.date >= yesterday]
     if chip == "breached":
         return df[df["sla_label"] == "breached"]
     if chip == "at_risk":
