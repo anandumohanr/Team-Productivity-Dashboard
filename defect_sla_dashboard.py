@@ -590,6 +590,19 @@ h2, h3 {{ color: {COLOR["text_primary"]} !important; }}
     box-shadow: 0 0 0 2px rgba(8,145,178,.25) !important;
 }}
 
+/* SLA-met chip — green to match the SLA 'met' status color */
+.st-key-chip_met .stButton > button {{
+    background: #15803d !important;
+    color: #fff !important;
+    border: 1px solid #15803d !important;
+}}
+.st-key-chip_met .stButton > button:hover {{ background: #166534 !important; }}
+.st-key-chip_met .stButton > button[kind="primary"] {{
+    background: #16a34a !important;
+    border-color: #16a34a !important;
+    box-shadow: 0 0 0 2px rgba(22,163,74,.25) !important;
+}}
+
 [data-testid="stSelectbox"] > div > div {{
     background: {COLOR["card_bg"]} !important; border: 1px solid {COLOR["border"]} !important;
     border-radius: 6px !important; color: {COLOR["text_primary"]} !important;
@@ -1215,7 +1228,7 @@ def _pill(text: str, bg: str, fg: str, mono: bool = False) -> str:
     )
 
 
-def _render_chip_filters(open_df: pd.DataFrame) -> str:
+def _render_chip_filters(open_df: pd.DataFrame, closed_met_df: pd.DataFrame) -> str:
     """Filter chips; returns the active chip key."""
     n_all = len(open_df)
     yesterday = datetime.now(IST).date() - timedelta(days=1)
@@ -1225,6 +1238,7 @@ def _render_chip_filters(open_df: pd.DataFrame) -> str:
         n_fresh = int((open_df["created"].dt.date >= yesterday).sum())
     n_breach = int((open_df["sla_label"] == "breached").sum())
     n_risk = int((open_df["sla_label"] == "at_risk").sum())
+    n_met = len(closed_met_df)
     n_p0 = int((open_df["priority"] == "P0").sum())
 
     chips = [
@@ -1232,6 +1246,7 @@ def _render_chip_filters(open_df: pd.DataFrame) -> str:
         ("fresh",    f"🆕 Today + Yesterday ({n_fresh})"),
         ("breached", f"Breached ({n_breach})"),
         ("at_risk",  f"At risk ({n_risk})"),
+        ("met",      f"SLA met ({n_met})"),
         ("p0",       f"P0 ({n_p0})"),
     ]
 
@@ -1265,13 +1280,18 @@ def _apply_chip_filter(df: pd.DataFrame, chip: str) -> pd.DataFrame:
     return df
 
 
-def _render_ticket_table(open_df: pd.DataFrame, jira_domain: str) -> None:
-    """Main table of open tickets. Sorted by sla_pct descending."""
+def _render_ticket_table(open_df: pd.DataFrame, jira_domain: str,
+                          showing_closed: bool = False) -> None:
+    """Main ticket table. For open tickets sorts by sla_pct desc; when
+    `showing_closed` is True, the caller pre-sorts (usually by resolved desc)."""
     if open_df.empty:
         st.info("No tickets match the current filter.")
         return
 
-    df = open_df.sort_values("sla_pct", ascending=False).reset_index(drop=True)
+    if showing_closed:
+        df = open_df.reset_index(drop=True)
+    else:
+        df = open_df.sort_values("sla_pct", ascending=False).reset_index(drop=True)
 
     th = (
         f"padding:10px 14px;font-size:11px;font-weight:600;"
@@ -1291,6 +1311,8 @@ def _render_ticket_table(open_df: pd.DataFrame, jira_domain: str) -> None:
             row_bg = "#FDF5F5"
         elif label == "at_risk":
             row_bg = "#FFFBF2"
+        elif label == "met":
+            row_bg = "#F3FAF5"
         else:
             row_bg = "#ffffff"
 
@@ -1336,6 +1358,8 @@ def _render_ticket_table(open_df: pd.DataFrame, jira_domain: str) -> None:
             sla_bg, sla_fg, sla_text = "#fef3c7", "#b45309", f"{pct}% used"
         elif label == "on_track":
             sla_bg, sla_fg, sla_text = "#dcfce7", "#15803d", f"{pct}% used"
+        elif label == "met":
+            sla_bg, sla_fg, sla_text = "#dcfce7", "#15803d", f"✓ met · {pct}%"
         else:
             sla_bg, sla_fg, sla_text = "#f1f5f9", "#64748b", "—"
         sla_html = (
@@ -1874,9 +1898,13 @@ def main() -> None:
         "Open tickets",
         "Sorted by SLA breach severity (highest % consumed first)",
     )
-    chip = _render_chip_filters(open_df)
-    table_df = _apply_chip_filter(open_df, chip)
-    _render_ticket_table(table_df, jira_domain)
+    closed_met_recent = closed_recent_df[closed_recent_df["sla_label"] == "met"]
+    chip = _render_chip_filters(open_df, closed_met_recent)
+    if chip == "met":
+        table_df = closed_met_recent.sort_values("resolved", ascending=False)
+    else:
+        table_df = _apply_chip_filter(open_df, chip)
+    _render_ticket_table(table_df, jira_domain, showing_closed=(chip == "met"))
     _render_stuck_workflow_callout(open_df, now)
 
     st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
