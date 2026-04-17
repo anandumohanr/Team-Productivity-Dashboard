@@ -559,6 +559,13 @@ header[data-testid="stHeader"],
 [data-testid="stStatusWidget"] {{ display: none !important; }}
 .stMainBlockContainer {{ padding-top: 0 !important; }}
 
+/* Collapse the invisible iframe that streamlit-autorefresh injects */
+div[data-testid="stElementContainer"]:has(iframe[title*="autorefresh"]),
+div[data-testid="element-container"]:has(iframe[title*="autorefresh"]) {{
+    display: none !important;
+}}
+iframe[title*="autorefresh"] {{ display: none !important; }}
+
 h1 {{ font-size: 22px !important; font-weight: 700 !important; color: {COLOR["text_primary"]} !important; }}
 h2, h3 {{ color: {COLOR["text_primary"]} !important; }}
 
