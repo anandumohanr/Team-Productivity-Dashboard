@@ -308,7 +308,7 @@ def load_defect_data() -> tuple[pd.DataFrame, datetime]:
 
     base_fields = [
         "key", "summary", "status", "priority",
-        "created", "resolutiondate", "updated",
+        "created", "customfield_10988", "updated",
         "assignee", "components", "description", "labels",
         "customfield_11012",  # Developer (from productivity dashboard)
     ]
@@ -345,7 +345,7 @@ def load_defect_data() -> tuple[pd.DataFrame, datetime]:
             "status": _normalize_str((f.get("status") or {}).get("name", "")),
             "priority": _normalize_priority(f.get("priority")),
             "created_raw": f.get("created"),
-            "resolved_raw": f.get("resolutiondate"),
+            "resolved_raw": f.get("customfield_10988"),
             "updated_raw": f.get("updated"),
             "developer": _normalize_developer(
                 f.get("customfield_11012"), f.get("assignee"),
@@ -761,22 +761,14 @@ def _render_header_bar(jira_domain: str, total_open: int, fetched_at: datetime,
     return start_date, end_date
 
 
-def _filter_by_range(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
-    """Keep rows whose `created` date falls within [start, end] inclusive."""
-    if df.empty:
-        return df
-    d = df["created"].dt.date
-    return df[(d >= start) & (d <= end)]
-
-
-def _kpi_snapshot_at(all_df: pd.DataFrame, start: date, end: date,
+def _kpi_snapshot_at(all_df: pd.DataFrame, period_start: date, period_end: date,
                      as_of: datetime) -> dict:
-    """Reconstruct KPI counts as of `as_of`, filtered to tickets created in
-    [start, end].
+    """Reconstruct KPI counts as of `as_of`.
 
-    Approximation: a ticket counts as 'closed by as_of' only if its FINAL status
-    is Closed AND its resolved timestamp is ≤ as_of. Reopens aren't tracked
-    (would need changelog API). Fine for WoW comparisons.
+    Live metrics (open, at_risk): tickets not yet closed as of as_of.
+    Period metrics (breached, met, avg_resolution, compliance): tickets closed
+    within [period_start, min(period_end, as_of.date())], matching the same
+    resolution-date pool used by the main KPI tiles.
     """
     empty = {
         "open": 0, "at_risk": 0, "breached": 0,
@@ -786,8 +778,7 @@ def _kpi_snapshot_at(all_df: pd.DataFrame, start: date, end: date,
     if all_df.empty:
         return empty
 
-    filtered = _filter_by_range(all_df, start, end)
-    filtered = filtered[filtered["created"] <= as_of]  # existed by as_of
+    filtered = all_df[all_df["created"] <= as_of].copy()
     if filtered.empty:
         return empty
 
@@ -800,7 +791,8 @@ def _kpi_snapshot_at(all_df: pd.DataFrame, start: date, end: date,
     open_snap = filtered[~closed_by]
     closed_snap = filtered[closed_by]
 
-    n_at_risk = n_breached = n_on_track = 0
+    # Live: open + at_risk (same compute_sla loop, no breached — breached is period-scoped)
+    n_at_risk = n_on_track = 0
     for _, r in open_snap.iterrows():
         sla = compute_sla(
             r["priority"],
@@ -809,33 +801,32 @@ def _kpi_snapshot_at(all_df: pd.DataFrame, start: date, end: date,
         )
         if sla["label"] == "at_risk":
             n_at_risk += 1
-        elif sla["label"] == "breached":
-            n_breached += 1
         elif sla["label"] == "on_track":
             n_on_track += 1
 
-    thirty_cutoff = as_of - timedelta(days=30)
-    closed_30d = closed_snap[closed_snap["resolved"] > thirty_cutoff]
-    n_closed = len(closed_30d)
-    n_met = 0
-    avg_res: float | None = None
+    # Period: closed in [period_start, min(period_end, as_of.date())]
+    effective_end = min(period_end, as_of.date())
+    closed_period = closed_snap[
+        (closed_snap["resolved"].dt.date >= period_start)
+        & (closed_snap["resolved"].dt.date <= effective_end)
+    ]
+    n_closed = len(closed_period)
     if n_closed > 0:
-        for _, r in closed_30d.iterrows():
-            sla = compute_sla(
-                r["priority"],
-                r["created"].to_pydatetime() if pd.notna(r["created"]) else None,
-                "Closed",
-                r["resolved"].to_pydatetime() if pd.notna(r["resolved"]) else None,
-                as_of,
-            )
-            if sla["label"] == "met":
-                n_met += 1
-        hours = (closed_30d["resolved"] - closed_30d["created"]).dt.total_seconds() / 3600
-        avg_res = float(hours.mean() / 24)
-
-    tracked = n_on_track + n_at_risk + n_breached
-    compliant = n_on_track + n_at_risk
-    compliance = round(compliant / tracked * 100, 1) if tracked else 100.0
+        n_met = int((closed_period["sla_label"] == "met").sum())
+        n_breached = int((closed_period["sla_label"] == "breached").sum())
+        hours = (closed_period["resolved"] - closed_period["created"]).dt.total_seconds() / 3600
+        avg_res: float | None = float(hours.mean() / 24)
+        period_tracked = closed_period[
+            closed_period["sla_label"].isin(["on_track", "at_risk", "breached", "met"])
+        ]
+        _n_pt = len(period_tracked)
+        compliance = round(
+            int((period_tracked["sla_label"].isin(["on_track", "at_risk", "met"])).sum()) / _n_pt * 100, 1
+        ) if _n_pt else 100.0
+    else:
+        n_met = n_breached = 0
+        avg_res = None
+        compliance = 100.0
 
     return {
         "open": len(open_snap),
@@ -847,48 +838,6 @@ def _kpi_snapshot_at(all_df: pd.DataFrame, start: date, end: date,
         "compliance_pct": compliance,
     }
 
-
-def _kpi_history(all_df: pd.DataFrame, start: date, end: date,
-                 now: datetime, days: int = 14) -> dict[str, list[float | None]]:
-    """Per-day KPI snapshots going back `days` days through today. Returns
-    metric → list of values, oldest first."""
-    keys = ["open", "at_risk", "breached", "met", "avg_resolution_days", "compliance_pct"]
-    out: dict[str, list[float | None]] = {k: [] for k in keys}
-    for i in range(days - 1, -1, -1):
-        snap = _kpi_snapshot_at(all_df, start, end, now - timedelta(days=i))
-        for k in keys:
-            out[k].append(snap.get(k))
-    return out
-
-
-def _sparkline_svg(values: list[float | None], color: str,
-                   width: int = 80, height: int = 24) -> str:
-    """Inline SVG polyline sparkline with a dot at the last point."""
-    indexed = [(i, v) for i, v in enumerate(values) if v is not None]
-    if len(indexed) < 2:
-        return ""
-    ys = [v for _, v in indexed]
-    vmin, vmax = min(ys), max(ys)
-    span = max(vmax - vmin, 1e-9)
-    n = len(values)
-    pad = 2
-    ih, iw = height - 2 * pad, width - 2 * pad
-    pts: list[tuple[float, float]] = []
-    for i, v in indexed:
-        x = pad + (i / max(n - 1, 1)) * iw
-        y = pad + (1 - (v - vmin) / span) * ih
-        pts.append((x, y))
-    polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
-    lx, ly = pts[-1]
-    return (
-        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
-        f'style="display:block">'
-        f'<polyline points="{polyline}" fill="none" stroke="{color}" '
-        f'stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" '
-        f'opacity="0.85"/>'
-        f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="2.2" fill="{color}"/>'
-        f'</svg>'
-    )
 
 
 def _fmt_wow_delta(diff: float | int | None, unit: str, invert: bool) -> tuple[str, str, str]:
@@ -910,49 +859,162 @@ def _fmt_wow_delta(diff: float | int | None, unit: str, invert: bool) -> tuple[s
     return f"{body} {arrow}", bg, fg
 
 
-def _render_triage_banner(open_df: pd.DataFrame) -> None:
-    """Red banner if any P0 tickets are breached. Dismissable per session."""
-    if st.session_state.get("triage_dismissed"):
-        return
-    breached_p0 = open_df[(open_df["priority"] == "P0") & (open_df["sla_label"] == "breached")]
-    if breached_p0.empty:
-        return
+def _render_health_banner(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
+                          start_date: date, end_date: date) -> None:
+    """Top-of-page health status banner with enriched executive summary."""
+    n_open = len(open_df)
+    n_at_risk = int((open_df["sla_label"] == "at_risk").sum())
+    n_closed = len(closed_recent_df)
 
-    keys = " · ".join(breached_p0["key"].tolist())
-    c1, c2 = st.columns([10, 1])
-    with c1:
-        st.markdown(f"""
-<div style="background:{COLOR["red_bg"]};border:1px solid {COLOR["red_fill"]};
-            border-left:4px solid {COLOR["red_fill"]};border-radius:8px;
-            padding:12px 16px;margin-bottom:16px">
-  <div style="font-size:14px;font-weight:700;color:{COLOR["red_text"]};margin-bottom:4px">
-    ⚠ {len(breached_p0)} P0 defect{'s' if len(breached_p0) > 1 else ''} past SLA — immediate attention required
-  </div>
-  <div style="font-size:12px;color:{COLOR["red_text"]};font-family:ui-monospace,monospace">
-    {keys}
+    # SLA breach + compliance use the same pool as SLA Met: tickets RESOLVED in the period.
+    period_tracked = closed_recent_df[closed_recent_df["sla_label"].isin(["on_track", "at_risk", "breached", "met"])]
+    n_breached = int((closed_recent_df["sla_label"] == "breached").sum())
+    _n_pt = len(period_tracked)
+    compliance_pct = round(
+        int((period_tracked["sla_label"].isin(["on_track", "at_risk", "met"])).sum()) / _n_pt * 100, 1
+    ) if _n_pt else 100.0
+
+    if compliance_pct >= 95:
+        status, icon = "HEALTHY", "✓"
+        fill, bg, border = COLOR["green_fill"], COLOR["green_bg"], "#86efac"
+    elif compliance_pct >= 80:
+        status, icon = "AT RISK", "⚠"
+        fill, bg, border = COLOR["amber_fill"], COLOR["amber_bg"], "#fcd34d"
+    else:
+        status, icon = "CRITICAL", "✕"
+        fill, bg, border = COLOR["red_fill"], COLOR["red_bg"], "#fca5a5"
+
+    p0_breach = int(((closed_recent_df["sla_label"] == "breached") & (closed_recent_df["priority"] == "P0")).sum())
+    p1_breach = int(((closed_recent_df["sla_label"] == "breached") & (closed_recent_df["priority"] == "P1")).sum())
+
+    if n_breached == 0 and n_at_risk == 0:
+        defect_word = "defect" if n_open == 1 else "defects"
+        summary = f"All {n_open} open {defect_word} are on track."
+    elif n_breached == 0:
+        summary = f"{n_open} open defect{'s' if n_open != 1 else ''} — {n_at_risk} approaching SLA deadline."
+    else:
+        parts = ([f"{p0_breach} P0"] if p0_breach else []) + ([f"{p1_breach} P1"] if p1_breach else [])
+        breach_detail = f" ({', '.join(parts)})" if parts else ""
+        summary = (
+            f"{n_open} open defect{'s' if n_open != 1 else ''} — "
+            f"{n_breached} breach SLA{breach_detail}, {n_at_risk} at risk."
+        )
+    closed_note = f" {n_closed} resolved in the last 30 days." if n_closed else ""
+
+    # Extra metrics
+    oldest_age = float(open_df["age_days"].max()) if not open_df.empty else 0.0
+    oldest_str = f"{oldest_age * 24:.0f}h" if oldest_age < 1 else f"{oldest_age:.0f}d"
+
+    avg_res_str = "—"
+    if not closed_recent_df.empty:
+        hours = (closed_recent_df["resolved"] - closed_recent_df["created"]).dt.total_seconds() / 3600
+        avg_res_str = f"{float(hours.mean()) / 24:.1f}d"
+
+    tagged = open_df[open_df["client"] != "CLIENT NOT TAGGED"]
+    n_clients = int(tagged["client"].nunique()) if not tagged.empty else 0
+    clients_chip = (
+        f'<span style="background:{COLOR["page_bg"]};color:{COLOR["text_primary"]};'
+        f'padding:3px 10px;border-radius:20px;font-size:11px;border:1px solid {COLOR["border"]}">'
+        f'clients affected: <strong>{n_clients}</strong></span>'
+    ) if n_clients else ""
+
+    comp_bg = fill + "22"
+    period_label = f"{start_date.strftime('%d %b')} – {end_date.strftime('%d %b %Y')}"
+    scope_lbl = (
+        f'font-size:9px;color:{COLOR["text_tertiary"]};text-transform:uppercase;'
+        f'letter-spacing:.08em;font-weight:600;margin-bottom:5px'
+    )
+    chip = (
+        f'background:{COLOR["page_bg"]};padding:3px 10px;border-radius:20px;'
+        f'font-size:11px;border:1px solid {COLOR["border"]}'
+    )
+    stats_html = f"""
+<div style="margin-top:10px">
+  <div style="{scope_lbl}">Live snapshot — all open defects</div>
+  <div style="display:flex;flex-wrap:wrap;gap:6px">
+    <span style="{chip};color:{COLOR["text_primary"]}">⏱ oldest open: <strong>{oldest_str}</strong></span>
+    {clients_chip}
   </div>
 </div>
+<div style="margin-top:8px">
+  <div style="{scope_lbl}">{period_label}</div>
+  <div style="display:flex;flex-wrap:wrap;gap:6px">
+    <span style="background:{comp_bg};color:{fill};padding:3px 10px;border-radius:20px;
+                 font-size:11px;font-weight:700">SLA {compliance_pct:.0f}%</span>
+    <span style="{chip};color:{COLOR["text_secondary"]}">target 95%</span>
+    <span style="{chip};color:{COLOR["text_primary"]}">✓ avg close: <strong>{avg_res_str}</strong></span>
+    <span style="{chip};color:{COLOR["text_secondary"]}">closed: <strong>{n_closed}</strong></span>
+  </div>
+</div>"""
+
+    # Per-priority breakdown — only priorities with open tickets
+    pri_cells = ""
+    for pri, pri_bg, pri_text in [
+        ("P0", COLOR["p0_bg"], COLOR["p0_text"]),
+        ("P1", COLOR["p1_bg"], COLOR["p1_text"]),
+        ("P2", COLOR["p2_bg"], COLOR["p2_text"]),
+        ("P3", COLOR["p3_bg"], COLOR["p3_text"]),
+    ]:
+        pri_df = open_df[open_df["priority"] == pri]
+        if pri_df.empty:
+            continue
+        n_b = int((pri_df["sla_label"] == "breached").sum())
+        n_r = int((pri_df["sla_label"] == "at_risk").sum())
+        n_t = int((pri_df["sla_label"] == "on_track").sum())
+        n_total = len(pri_df)
+        detail_parts = []
+        if n_b:
+            detail_parts.append(f'<span style="color:{COLOR["red_fill"]};font-weight:700">{n_b} breach</span>')
+        if n_r:
+            detail_parts.append(f'<span style="color:{COLOR["amber_fill"]};font-weight:600">{n_r} at-risk</span>')
+        if n_t:
+            detail_parts.append(f'<span style="color:{COLOR["text_secondary"]}">{n_t} on-track</span>')
+        if not detail_parts:
+            detail_parts.append(f'<span style="color:{COLOR["text_secondary"]}">{n_total} open</span>')
+        detail = " · ".join(detail_parts)
+        pri_cells += (
+            f'<div style="display:flex;align-items:baseline;gap:5px;padding-right:20px">'
+            f'<span style="background:{pri_bg};color:{pri_text};font-size:10px;font-weight:700;'
+            f'padding:2px 7px;border-radius:6px;letter-spacing:.04em;flex-shrink:0">{pri}</span>'
+            f'<span style="font-size:12px">{detail}</span>'
+            f'</div>'
+        )
+
+    priority_row = (
+        f'<div style="margin-top:10px;padding-top:10px;border-top:1px solid {border}">'
+        f'<div style="{scope_lbl}">Live snapshot — by priority</div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:4px">{pri_cells}</div>'
+        f'</div>'
+    ) if pri_cells else ""
+
+    st.markdown(f"""
+<div style="background:{bg};border:1.5px solid {border};border-radius:12px;
+            padding:16px 20px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,.05)">
+  <div style="display:flex;align-items:center;gap:16px">
+    <div style="background:{fill};color:#fff;border-radius:8px;padding:10px 14px;
+                font-size:12px;font-weight:700;letter-spacing:.1em;white-space:nowrap;
+                min-width:90px;text-align:center;flex-shrink:0">{icon} {status}</div>
+    <div style="font-size:13px;font-weight:600;color:{COLOR["text_primary"]};line-height:1.5">
+      {summary}{closed_note}
+    </div>
+  </div>
+  {stats_html}
+  {priority_row}
+</div>
 """, unsafe_allow_html=True)
-    with c2:
-        if st.button("✕", key="dismiss_triage", help="Dismiss for this session"):
-            st.session_state["triage_dismissed"] = True
-            st.rerun()
+
 
 
 def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
-                      prev_snap: dict, history: dict[str, list[float | None]]) -> None:
+                      prev_snap: dict, start_date: date, end_date: date) -> None:
     n_open = len(open_df)
     at_risk_df = open_df[open_df["sla_label"] == "at_risk"]
-    breached_df = open_df[open_df["sla_label"] == "breached"]
 
     n_at_risk = len(at_risk_df)
-    n_breached = len(breached_df)
     top_at_risk = (
         at_risk_df.sort_values("sla_pct", ascending=False).iloc[0]["key"]
         if not at_risk_df.empty else "—"
     )
-    p0_breach = int((breached_df["priority"] == "P0").sum())
-    p1_breach = int((breached_df["priority"] == "P1").sum())
 
     if not closed_recent_df.empty:
         hours = (closed_recent_df["resolved"] - closed_recent_df["created"]).dt.total_seconds() / 3600
@@ -968,10 +1030,17 @@ def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
         n_met = 0
         met_pct = 0
 
-    tracked = open_df[open_df["sla_label"].isin(["on_track", "at_risk", "breached", "met"])]
-    total_tracked = len(tracked)
-    compliant = int((tracked["sla_label"].isin(["on_track", "at_risk", "met"])).sum())
-    compliance_pct = round(compliant / total_tracked * 100, 1) if total_tracked else 100.0
+    # SLA breach + compliance use the same pool as SLA Met: tickets RESOLVED in the period.
+    # This keeps all four metrics (Breached, Met, Avg Resolution, Compliance) on the same
+    # time basis so that Breached + Met <= Closed always holds.
+    n_breached = int((closed_recent_df["sla_label"] == "breached").sum())
+    p0_breach = int(((closed_recent_df["sla_label"] == "breached") & (closed_recent_df["priority"] == "P0")).sum())
+    p1_breach = int(((closed_recent_df["sla_label"] == "breached") & (closed_recent_df["priority"] == "P1")).sum())
+    period_tracked = closed_recent_df[closed_recent_df["sla_label"].isin(["on_track", "at_risk", "breached", "met"])]
+    _n_pt = len(period_tracked)
+    compliance_pct = round(
+        int((period_tracked["sla_label"].isin(["on_track", "at_risk", "met"])).sum()) / _n_pt * 100, 1
+    ) if _n_pt else 100.0
 
     if compliance_pct >= 95:
         comp_accent = COLOR["green_fill"]
@@ -980,7 +1049,7 @@ def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
     else:
         comp_accent = COLOR["red_fill"]
 
-    met_secondary = f"n={n_closed} closed · {met_pct}%" if n_closed else "No closures (30d)"
+    met_secondary = f"n={n_closed} closed · {met_pct}%" if n_closed else "No closures"
 
     # WoW deltas — each tuple: (diff, unit, invert_polarity)
     prev_avg = prev_snap.get("avg_resolution_days")
@@ -994,17 +1063,20 @@ def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
         "compliance": (compliance_pct - prev_snap["compliance_pct"], "%", False),
     }
 
+    live_scope = "live · all open"
+    period_scope = f"{start_date.strftime('%d %b')} – {end_date.strftime('%d %b %Y')}"
+
     tiles = [
-        ("Open defects",    str(n_open),              "Not yet Closed",                              COLOR["text_secondary"], "open",       "open"),
-        ("At risk",         str(n_at_risk),           f"Top: {top_at_risk}",                         COLOR["amber_fill"],     "at_risk",    "at_risk"),
-        ("SLA breached",    str(n_breached),          f"{p0_breach}× P0 · {p1_breach}× P1",          COLOR["red_fill"],       "breached",   "breached"),
-        ("SLA met (30d)",   str(n_met),               met_secondary,                                 COLOR["green_fill"],     "met",        "met"),
-        ("Avg resolution",  avg_resolution,           f"n={n_closed} closed",                        COLOR["text_secondary"], "avg",        "avg_resolution_days"),
-        ("SLA compliance",  f"{compliance_pct:.0f}%", "Target: 95%",                                 comp_accent,             "compliance", "compliance_pct"),
+        ("Open defects",    live_scope,    str(n_open),              "Not yet Closed",                              COLOR["text_secondary"], "open"),
+        ("At risk",         live_scope,    str(n_at_risk),           f"Top: {top_at_risk}",                         COLOR["amber_fill"],     "at_risk"),
+        ("SLA breached",    period_scope,  str(n_breached),          f"{p0_breach}× P0 · {p1_breach}× P1",          COLOR["red_fill"],       "breached"),
+        ("SLA met",         period_scope,  str(n_met),               met_secondary,                                 COLOR["green_fill"],     "met"),
+        ("Avg resolution",  period_scope,  avg_resolution,           f"n={n_closed} closed",                        COLOR["text_secondary"], "avg"),
+        ("SLA compliance",  period_scope,  f"{compliance_pct:.0f}%", "Target: 95%",                                 comp_accent,             "compliance"),
     ]
 
     cols = st.columns(6)
-    for col, (label, value, secondary, accent, delta_key, hist_key) in zip(cols, tiles):
+    for col, (label, scope, value, secondary, accent, delta_key) in zip(cols, tiles):
         diff, unit, invert = deltas[delta_key]
         delta_text, delta_bg, delta_fg = _fmt_wow_delta(diff, unit, invert)
         delta_html = (
@@ -1012,28 +1084,19 @@ def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
             f'padding:2px 8px;font-size:10px;color:{delta_fg};font-weight:600;margin-bottom:6px">'
             f'{delta_text} <span style="opacity:.7;font-weight:500">vs 7d ago</span></div>'
         )
-        spark_color = accent if accent != COLOR["text_secondary"] else "#64748b"
-        spark_svg = _sparkline_svg(history.get(hist_key, []), spark_color)
-        spark_html = (
-            f'<div style="margin-top:10px;padding-top:10px;'
-            f'border-top:1px dashed {COLOR["border"]};'
-            f'display:flex;align-items:center;justify-content:space-between">'
-            f'<span style="font-size:10px;color:{COLOR["text_tertiary"]};'
-            f'text-transform:uppercase;letter-spacing:.06em;font-weight:600">14d trend</span>'
-            f'{spark_svg}</div>'
-        ) if spark_svg else ""
         with col:
             st.markdown(f"""
 <div style="background:{COLOR["card_bg"]};border-radius:12px;padding:20px 18px;
             border:1px solid {COLOR["border"]};border-top:3px solid {accent};
             box-shadow:0 1px 4px rgba(0,0,0,.06)">
   <div style="font-size:11px;color:{COLOR["text_secondary"]};letter-spacing:.07em;
-              text-transform:uppercase;font-weight:600;margin-bottom:10px">{label}</div>
+              text-transform:uppercase;font-weight:600;margin-bottom:2px">{label}</div>
+  <div style="font-size:9px;color:{COLOR["text_tertiary"]};letter-spacing:.05em;
+              font-weight:500;margin-bottom:10px">{scope}</div>
   <div style="font-size:32px;font-weight:700;color:{COLOR["text_primary"]};
               line-height:1;margin-bottom:8px;letter-spacing:-.02em">{value}</div>
   {delta_html}
   <div style="font-size:12px;color:{COLOR["text_secondary"]};font-weight:500">{secondary}</div>
-  {spark_html}
 </div>
 """, unsafe_allow_html=True)
 
@@ -1583,6 +1646,155 @@ def _render_breakdowns(open_df: pd.DataFrame) -> None:
 """, unsafe_allow_html=True)
 
 
+def _render_monthly_trend(all_df: pd.DataFrame, now: datetime) -> None:
+    """Line chart: bugs raised vs resolved. Last-month view is week-granular; others monthly."""
+    today = now.date()
+    first_this_month = today.replace(day=1)
+    last_month_end = first_this_month - timedelta(days=1)
+    last_month_start = last_month_end.replace(day=1)
+
+    hdr_col, toggle_col = st.columns([3, 2])
+    with toggle_col:
+        st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
+        view = st.radio(
+            "monthly_trend_view",
+            ["Last month", "Last 6M", "This year", "Last year"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="monthly_trend_view",
+        )
+
+    if view == "Last month":
+        range_start, range_end = last_month_start, last_month_end
+        subtitle = f"Weekly — {last_month_start.strftime('%B %Y')}"
+        partial_note = ""
+        weekly = True
+    elif view == "Last 6M":
+        y, m = today.year, today.month - 5
+        while m <= 0:
+            m += 12
+            y -= 1
+        range_start, range_end = date(y, m, 1), today
+        subtitle = "Monthly — last 6 months"
+        partial_note = (
+            f"* {today.strftime('%B %Y')} is a partial month "
+            f"(data up to {today.strftime('%-d %b')})"
+        )
+        weekly = False
+    elif view == "This year":
+        range_start, range_end = today.replace(month=1, day=1), today
+        subtitle = f"Monthly — {today.year}"
+        partial_note = (
+            f"* {today.strftime('%B %Y')} is a partial month "
+            f"(data up to {today.strftime('%-d %b')})"
+        )
+        weekly = False
+    else:
+        range_start, range_end = date(today.year - 1, 1, 1), date(today.year - 1, 12, 31)
+        subtitle = f"Monthly — {today.year - 1}"
+        partial_note = ""
+        weekly = False
+
+    with hdr_col:
+        _section_header("Trend", subtitle)
+
+    if all_df.empty:
+        st.info("No ticket data available.")
+        return
+
+    days_in_last_month = last_month_end.day
+    month_abbr = last_month_start.strftime("%b")
+
+    def _week_label(day: int) -> str:
+        wk = (day - 1) // 7
+        w_start = wk * 7 + 1
+        w_end = min((wk + 1) * 7, days_in_last_month)
+        return f"{w_start}–{w_end} {month_abbr}"
+
+    def _week_sort(day: int) -> str:
+        return str((day - 1) // 7)
+
+    def _build_series(date_col: str, metric_name: str) -> pd.DataFrame:
+        sub = all_df[
+            all_df[date_col].notna()
+            & all_df[date_col].dt.date.between(range_start, range_end)
+        ].copy()
+        if sub.empty:
+            return pd.DataFrame(columns=["x_label", "sort_key", "count", "metric"])
+        if weekly:
+            sub["x_label"] = sub[date_col].dt.day.apply(_week_label)
+            sub["sort_key"] = sub[date_col].dt.day.apply(_week_sort)
+        else:
+            sub["x_label"] = sub[date_col].dt.strftime("%B %Y")
+            sub["sort_key"] = sub[date_col].dt.to_period("M").astype(str)
+        grouped = sub.groupby(["x_label", "sort_key"]).size().reset_index(name="count")
+        grouped["metric"] = metric_name
+        return grouped
+
+    raised_df = _build_series("created", "Raised")
+    resolved_df = _build_series("resolved", "Resolved")
+    chart_df = pd.concat([raised_df, resolved_df], ignore_index=True)
+
+    if chart_df.empty:
+        st.info("No data in the selected range.")
+        return
+
+    # Fill zeros so both lines span the same x-axis periods
+    all_periods = chart_df[["x_label", "sort_key"]].drop_duplicates()
+    full_grid = all_periods.merge(
+        pd.DataFrame({"metric": ["Raised", "Resolved"]}), how="cross"
+    )
+    chart_df = (
+        full_grid.merge(chart_df, on=["x_label", "sort_key", "metric"], how="left")
+        .fillna({"count": 0})
+        .assign(count=lambda d: d["count"].astype(int))
+    )
+    sort_order = chart_df.sort_values("sort_key")["x_label"].unique().tolist()
+
+    x_enc = alt.X(
+        "x_label:O", title=None, sort=sort_order,
+        axis=alt.Axis(labelAngle=-30, labelColor=COLOR["text_secondary"],
+                      domainColor=COLOR["border"], tickColor=COLOR["border"]),
+    )
+    y_enc = alt.Y(
+        "count:Q", title="Tickets",
+        axis=alt.Axis(gridColor=COLOR["border"], labelColor=COLOR["text_secondary"],
+                      titleColor=COLOR["text_secondary"], tickMinStep=1),
+    )
+    color_enc = alt.Color(
+        "metric:N",
+        scale=alt.Scale(domain=["Raised", "Resolved"],
+                        range=[COLOR["amber_fill"], COLOR["green_fill"]]),
+        legend=alt.Legend(orient="top-right", title=None,
+                          labelColor=COLOR["text_secondary"], labelFontSize=12),
+    )
+    tooltip_enc = [
+        alt.Tooltip("x_label:O", title="Period"),
+        alt.Tooltip("metric:N", title=""),
+        alt.Tooltip("count:Q", title="Count"),
+    ]
+
+    base = alt.Chart(chart_df).encode(x=x_enc, y=y_enc, color=color_enc, tooltip=tooltip_enc)
+    line  = base.mark_line(strokeWidth=2.5, interpolate="monotone")
+    points = base.mark_point(size=60, filled=True)
+
+    chart = (
+        alt.layer(line, points)
+        .resolve_scale(color="shared")
+        .properties(height=300, background="transparent")
+        .configure_view(strokeWidth=0, fill="transparent")
+    )
+
+    st.altair_chart(chart, use_container_width=True)
+
+    if partial_note:
+        st.markdown(
+            f'<div style="font-size:11px;color:{COLOR["text_tertiary"]};'
+            f'margin-top:-8px;padding-left:4px">{partial_note}</div>',
+            unsafe_allow_html=True,
+        )
+
+
 def _render_trend_footer(all_df: pd.DataFrame, start: date, end: date) -> None:
     """Flow summary for the selected date range: reported, closed, net backlog, oldest open."""
     created = all_df["created"].dt.date
@@ -1596,10 +1808,8 @@ def _render_trend_footer(all_df: pd.DataFrame, start: date, end: date) -> None:
     reported = int(in_range_created.sum())
     closed = int(in_range_closed.sum())
     net = reported - closed
-    open_in_range = all_df[
-        (all_df["status"].str.lower() != "closed") & in_range_created
-    ]
-    oldest_age = int(open_in_range["age_days"].max()) if not open_in_range.empty else 0
+    open_all = all_df[all_df["status"].str.lower() != "closed"]
+    oldest_age = int(open_all["age_days"].max()) if not open_all.empty else 0
 
     net_color = COLOR["red_fill"] if net > 0 else COLOR["green_fill"]
     net_icon = "▲" if net > 0 else ("▼" if net < 0 else "•")
@@ -1758,7 +1968,7 @@ def _render_share_section(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
 
         f'<p style="font-size:13px;font-weight:bold;margin-bottom:6px;color:#111111">Summary</p>'
         f'<table style="border-collapse:collapse;margin-bottom:18px" cellpadding="0" cellspacing="0">'
-        f'<tr>{hdr("Open")}{hdr("At risk")}{hdr("Breached")}{hdr("P0/P1/P2/P3 breach")}{hdr("Closed 30d")}</tr>'
+        f'<tr>{hdr("Open")}{hdr("At risk")}{hdr("Breached")}{hdr("P0/P1/P2/P3 breach")}{hdr("Closed")}</tr>'
         f'<tr><td style="{td_base}">{n_open}</td>'
         f'<td style="{td_base}">{n_risk}</td>'
         f'<td style="{td_base}">{n_breach}</td>'
@@ -1845,20 +2055,25 @@ def main() -> None:
     # Partition by status
     is_closed = derived_df["status"].str.lower() == "closed"
     open_df_all = derived_df[~is_closed].copy()
-    cutoff_30d = now - timedelta(days=30)
-    closed_recent_df = derived_df[
-        is_closed & (derived_df["resolved"] >= cutoff_30d)
-    ].copy()
 
-    # Header + filters
+    # Header + filters — must come before closed_recent_df so we have start/end date
     today = now.date()
     start_date, end_date = _render_header_bar(
         jira_domain, len(open_df_all), fetched_at, today,
     )
 
-    # Apply period filter to the open set (table + KPIs).
-    # Trend footer always uses the full 30-day window regardless of filters.
-    open_df = _filter_by_range(open_df_all, start_date, end_date)
+    # Closed tickets resolved within the selected date range.
+    # Drives: SLA Met, Avg Resolution, Median Resolution, closed count in banner/share.
+    closed_recent_df = derived_df[
+        is_closed
+        & (derived_df["resolved"].dt.date >= start_date)
+        & (derived_df["resolved"].dt.date <= end_date)
+    ].copy()
+
+    # Open defects = all currently-open tickets regardless of when they were created.
+    # Spillovers from prior periods must be counted. The date range only controls
+    # the "Period Activity" footer (Reported / Closed counts).
+    open_df = open_df_all
 
     st.markdown(
         f"<div style='height:1px;background:linear-gradient(90deg,{COLOR['accent']},transparent);"
@@ -1866,15 +2081,14 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    # Triage banner (session-dismissable)
-    _render_triage_banner(open_df)
+    # Overall health status + executive summary
+    _render_health_banner(open_df, closed_recent_df, start_date, end_date)
 
     # Section 1: KPI tiles (with week-over-week delta pills)
     prev_snap = _kpi_snapshot_at(
         derived_df, start_date, end_date, now - timedelta(days=7),
     )
-    history = _kpi_history(derived_df, start_date, end_date, now, days=14)
-    _render_kpi_cards(open_df, closed_recent_df, prev_snap, history)
+    _render_kpi_cards(open_df, closed_recent_df, prev_snap, start_date, end_date)
 
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
@@ -1909,7 +2123,12 @@ def main() -> None:
 
     st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
 
-    # Section 4: Three-column breakdowns
+    # Section 4: Monthly trend
+    _render_monthly_trend(derived_df, now)
+
+    st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+
+    # Section 5: Three-column breakdowns
     _section_header("Breakdowns")
     _render_breakdowns(open_df)
 
