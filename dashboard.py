@@ -7,6 +7,7 @@ import altair as alt
 import pytz
 import unicodedata
 import re
+import html as _html
 from requests.auth import HTTPBasicAuth
 
 # =====================
@@ -16,6 +17,12 @@ COMPLETED_STATUSES = ["ACCEPTED IN QA", "CLOSED"]
 SP_BASELINE_PER_DAY = 1          # 5 SP/week baseline
 PROD_GREEN_THRESHOLD = 80        # productivity % → green
 PROD_YELLOW_THRESHOLD = 60       # productivity % → yellow, else red
+
+# Sprint structure — 2-week sprint has 10 calendar working days but only 7 dev days
+# (3 days are sprint ceremonies: planning, review, retro)
+SPRINT_WORKING_DAYS = 10
+SPRINT_DEV_DAYS = 7
+DEV_DAY_RATIO = SPRINT_DEV_DAYS / SPRINT_WORKING_DAYS   # 0.7
 
 # =====================
 # Data loading
@@ -170,6 +177,11 @@ def count_working_days(start_dt, end_dt):
     return sum(1 for d in pd.date_range(start=start_dt, end=end_dt) if d.weekday() < 5)
 
 
+def count_dev_days(start_dt, end_dt):
+    """Working days adjusted for sprint ceremony overhead (7 dev days per 10-day sprint)."""
+    return count_working_days(start_dt, end_dt) * DEV_DAY_RATIO
+
+
 def get_period_bounds(period_type: str, today: date):
     """Returns (start, end, prev_start, prev_end) as date objects."""
     if period_type == "This Week":
@@ -225,7 +237,8 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
     """
     Returns (team_metrics dict, dev_metrics DataFrame) for the given date range.
 
-    Productivity % = Completed SP / (working_days × SP_BASELINE_PER_DAY × n_devs)
+    Productivity % = Completed SP / (dev_days × SP_BASELINE_PER_DAY × n_devs)
+                   dev_days = working_days × DEV_DAY_RATIO (7 dev days per 10-day sprint)
     Quality Score  = 100 − (bug_density × 200), clipped to [0, 100]
     """
     in_period = df[
@@ -245,8 +258,9 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
 
     all_devs = sorted(in_period["Developer"].dropna().unique())
 
-    working_days = count_working_days(start_date, end_date)
+    working_days = count_dev_days(start_date, end_date)
     expected_sp_per_dev = max(working_days * SP_BASELINE_PER_DAY, 1)
+    target_sp_per_dev = int(round(expected_sp_per_dev))
 
     dev_rows = []
     for dev in all_devs:
@@ -256,7 +270,7 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
         completed_sp = dev_completed["Story Points"].sum()
         bug_count = len(dev_bugs)
 
-        productivity_pct = round(completed_sp / expected_sp_per_dev * 100, 1)
+        productivity_pct = round(completed_sp / target_sp_per_dev * 100, 1) if target_sp_per_dev > 0 else 0.0
         if completed_sp > 0:
             bug_density = bug_count / completed_sp
             quality_score = int(max(0, min(100, round(100 - bug_density * 200))))
@@ -268,19 +282,20 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
         dev_rows.append({
             "Developer": dev,
             "Completed SP": int(completed_sp),
+            "Target SP": target_sp_per_dev,
             "Productivity %": productivity_pct,
             "Bugs": bug_count,
             "Quality Score": quality_score,
         })
 
     dev_df = pd.DataFrame(dev_rows) if dev_rows else pd.DataFrame(
-        columns=["Developer", "Completed SP", "Productivity %", "Bugs", "Quality Score"]
+        columns=["Developer", "Completed SP", "Target SP", "Productivity %", "Bugs", "Quality Score"]
     )
 
     n_real_devs = sum(1 for d in all_devs if d != "(Unassigned)")
     n_devs = max(len(all_devs), 1)
     team_completed_sp = int(completed["Story Points"].sum())
-    team_expected_sp = expected_sp_per_dev * n_devs
+    team_expected_sp = max(target_sp_per_dev * n_real_devs, 1)
     team_productivity = round(team_completed_sp / team_expected_sp * 100, 1)
     total_bugs = len(bugs_in_period)
     if team_completed_sp > 0:
@@ -293,7 +308,7 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
 
     team_metrics = {
         "Active Devs": n_real_devs,
-        "Capacity SP": expected_sp_per_dev * n_real_devs,
+        "Capacity SP": target_sp_per_dev * n_real_devs,
         "Completed SP": team_completed_sp,
         "Productivity %": team_productivity,
         "Bugs": total_bugs,
@@ -447,7 +462,7 @@ def render_kpi_cards(curr: dict, prev: dict):
         display_val = f"{val:.1f}%" if "%" in key else str(val)
 
         if key == "Active Devs":
-            cap = curr.get("Capacity SP", 0)
+            cap = int(round(curr.get("Capacity SP", 0)))
             bottom_html = (
                 f'<div style="display:inline-block;background:#ede9fe;border-radius:20px;'
                 f'padding:3px 10px;font-size:11px;color:#8b5cf6;font-weight:600">'
@@ -522,7 +537,8 @@ def render_dev_table(curr_dev: pd.DataFrame, prev_dev: pd.DataFrame):
             f'onmouseover="this.style.background=\'#eff6ff\'" '
             f'onmouseout="this.style.background=\'{bg}\'">'
             f'<td style="{td}">{_badge(r["Productivity %"])}</td>'
-            f'<td style="{td};font-weight:600;color:#0f172a">{r["Developer"]}</td>'
+            f'<td style="{td};font-weight:600;color:#0f172a">{_html.escape(str(r["Developer"]))}</td>'
+            f'<td style="{td};text-align:center;font-size:13px;color:#64748b">{int(r["Target SP"])}</td>'
             f'<td style="{td};text-align:center;font-weight:700;font-size:15px;color:#4f46e5">{int(r["Completed SP"])}</td>'
             f'<td style="{td}">{_progress(r["Productivity %"])}</td>'
             f'<td style="{td};text-align:center;font-weight:700;color:{bug_clr}">{r["Bugs"]}</td>'
@@ -541,6 +557,7 @@ def render_dev_table(curr_dev: pd.DataFrame, prev_dev: pd.DataFrame):
       <tr style="background:#f8fafc">
         <th style="{th}">Status</th>
         <th style="{th}">Developer</th>
+        <th style="{th};text-align:center">Target SP</th>
         <th style="{th};text-align:center">Completed SP</th>
         <th style="{th}">Productivity</th>
         <th style="{th};text-align:center">Bugs</th>
@@ -760,7 +777,7 @@ def render_share_section(period_label: str, team: dict, dev_df: pd.DataFrame):
         cell = td_alt if i % 2 else td
         dev_rows += (
             f'<tr>'
-            f'<td style="{cell}">{r["Developer"]}</td>'
+            f'<td style="{cell}">{_html.escape(str(r["Developer"]))}</td>'
             f'<td style="{cell}">{int(r["Completed SP"])}</td>'
             f'<td style="{cell}">{r["Productivity %"]:.1f}%</td>'
             f'<td style="{cell}">{r["Bugs"]}</td>'
