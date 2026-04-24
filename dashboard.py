@@ -243,10 +243,7 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
     else:
         bugs_in_period = empty_bugs
 
-    all_devs = sorted(
-        set(in_period["Developer"].dropna().unique()) |
-        set(bugs_in_period["Developer"].dropna().unique())
-    )
+    all_devs = sorted(in_period["Developer"].dropna().unique())
 
     working_days = count_working_days(start_date, end_date)
     expected_sp_per_dev = max(working_days * SP_BASELINE_PER_DAY, 1)
@@ -280,6 +277,7 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
         columns=["Developer", "Completed SP", "Productivity %", "Bugs", "Quality Score"]
     )
 
+    n_real_devs = sum(1 for d in all_devs if d != "(Unassigned)")
     n_devs = max(len(all_devs), 1)
     team_completed_sp = int(completed["Story Points"].sum())
     team_expected_sp = expected_sp_per_dev * n_devs
@@ -294,6 +292,8 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
         team_quality = 100
 
     team_metrics = {
+        "Active Devs": n_real_devs,
+        "Capacity SP": expected_sp_per_dev * n_real_devs,
         "Completed SP": team_completed_sp,
         "Productivity %": team_productivity,
         "Bugs": total_bugs,
@@ -426,10 +426,10 @@ def _fmt_delta(diff, unit, invert):
 
 def render_kpi_cards(curr: dict, prev: dict):
     metrics_cfg = [
-        ("Completed SP", "",  False, "#6366f1", "SP"),
-        ("Productivity %",  "%", False, "#06b6d4", "%"),
-        ("Bugs",            "",  True,  "#f43f5e", "🐛"),
-        ("Quality Score",   "",  False, "#10b981", "Q"),
+        ("Active Devs",    "",  False, "#8b5cf6", "👥"),
+        ("Completed SP",   "",  False, "#6366f1", "SP"),
+        ("Productivity %", "%", False, "#06b6d4", "%"),
+        ("Bugs",           "",  True,  "#f43f5e", "🐛"),
     ]
 
     cols = st.columns(4)
@@ -446,6 +446,20 @@ def render_kpi_cards(curr: dict, prev: dict):
         delta_bg    = "#dcfce7" if is_pos is True else ("#fee2e2" if is_pos is False else "#f1f5f9")
         display_val = f"{val:.1f}%" if "%" in key else str(val)
 
+        if key == "Active Devs":
+            cap = curr.get("Capacity SP", 0)
+            bottom_html = (
+                f'<div style="display:inline-block;background:#ede9fe;border-radius:20px;'
+                f'padding:3px 10px;font-size:11px;color:#8b5cf6;font-weight:600">'
+                f'{cap} SP capacity</div>'
+            )
+        else:
+            bottom_html = (
+                f'<div style="display:inline-block;background:{delta_bg};border-radius:20px;'
+                f'padding:3px 10px;font-size:11px;color:{delta_color};font-weight:600">'
+                f'{dstr} vs prev period</div>'
+            )
+
         with col:
             st.markdown(f"""
 <div style="background:#ffffff;border-radius:12px;padding:20px 18px;
@@ -460,10 +474,7 @@ def render_kpi_cards(curr: dict, prev: dict):
               text-transform:uppercase;font-weight:600;margin-bottom:10px">{key}</div>
   <div style="font-size:32px;font-weight:700;color:#0f172a;
               line-height:1;margin-bottom:10px;letter-spacing:-.02em">{display_val}</div>
-  <div style="display:inline-block;background:{delta_bg};border-radius:20px;
-              padding:3px 10px;font-size:11px;color:{delta_color};font-weight:600">
-    {dstr} vs prev period
-  </div>
+  {bottom_html}
 </div>""", unsafe_allow_html=True)
 
 
