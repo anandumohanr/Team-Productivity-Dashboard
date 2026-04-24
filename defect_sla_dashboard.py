@@ -639,6 +639,44 @@ hr {{ border-color: {COLOR["border"]} !important; margin: 1.5rem 0 !important; }
 ::-webkit-scrollbar-track {{ background: #f1f5f9; }}
 ::-webkit-scrollbar-thumb {{ background: #cbd5e1; border-radius: 3px; }}
 ::-webkit-scrollbar-thumb:hover {{ background: #94a3b8; }}
+
+/* Clickable KPI cards — transparent overlay button, position:absolute so it
+   takes zero space in normal flow and matches the card's exact dimensions. */
+div:has(> :is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+              .st-key-btn_breached_popup, .st-key-btn_met_popup)) {{
+    position: relative !important;
+}}
+:is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+    .st-key-btn_breached_popup, .st-key-btn_met_popup) {{
+    position: absolute !important;
+    top: 0 !important; left: 0 !important;
+    right: 0 !important; bottom: 0 !important;
+    z-index: 10 !important;
+    margin: 0 !important; padding: 0 !important;
+    pointer-events: none !important;
+}}
+:is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+    .st-key-btn_breached_popup, .st-key-btn_met_popup) > div {{
+    height: 100% !important;
+    margin: 0 !important;
+}}
+:is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+    .st-key-btn_breached_popup, .st-key-btn_met_popup) > div > button {{
+    height: 100% !important;
+    width: 100% !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    outline: none !important;
+    padding: 0 !important;
+    cursor: pointer !important;
+    border-radius: 12px !important;
+    pointer-events: auto !important;
+}}
+:is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+    .st-key-btn_breached_popup, .st-key-btn_met_popup) > div > button:hover {{
+    background: transparent !important;
+}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -774,6 +812,7 @@ def _kpi_snapshot_at(all_df: pd.DataFrame, period_start: date, period_end: date,
         "open": 0, "at_risk": 0, "breached": 0,
         "met": 0, "n_closed": 0,
         "avg_resolution_days": None, "compliance_pct": 100.0,
+        "reported": 0,
     }
     if all_df.empty:
         return empty
@@ -828,6 +867,12 @@ def _kpi_snapshot_at(all_df: pd.DataFrame, period_start: date, period_end: date,
         avg_res = None
         compliance = 100.0
 
+    reported_snap = int((
+        filtered["created"].notna()
+        & (filtered["created"].dt.date >= period_start)
+        & (filtered["created"].dt.date <= effective_end)
+    ).sum())
+
     return {
         "open": len(open_snap),
         "at_risk": n_at_risk,
@@ -836,6 +881,7 @@ def _kpi_snapshot_at(all_df: pd.DataFrame, period_start: date, period_end: date,
         "n_closed": n_closed,
         "avg_resolution_days": avg_res,
         "compliance_pct": compliance,
+        "reported": reported_snap,
     }
 
 
@@ -1006,15 +1052,18 @@ def _render_health_banner(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
 
 
 def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
-                      prev_snap: dict, start_date: date, end_date: date) -> None:
+                      prev_snap: dict, start_date: date, end_date: date,
+                      all_df: pd.DataFrame, jira_domain: str,
+                      reported_df: pd.DataFrame | None = None) -> None:
     n_open = len(open_df)
-    at_risk_df = open_df[open_df["sla_label"] == "at_risk"]
 
-    n_at_risk = len(at_risk_df)
-    top_at_risk = (
-        at_risk_df.sort_values("sla_pct", ascending=False).iloc[0]["key"]
-        if not at_risk_df.empty else "—"
-    )
+    if reported_df is None:
+        reported_df = all_df[
+            all_df["created"].notna()
+            & (all_df["created"].dt.date >= start_date)
+            & (all_df["created"].dt.date <= end_date)
+        ].copy()
+    n_reported = len(reported_df)
 
     if not closed_recent_df.empty:
         hours = (closed_recent_df["resolved"] - closed_recent_df["created"]).dt.total_seconds() / 3600
@@ -1030,75 +1079,83 @@ def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
         n_met = 0
         met_pct = 0
 
-    # SLA breach + compliance use the same pool as SLA Met: tickets RESOLVED in the period.
-    # This keeps all four metrics (Breached, Met, Avg Resolution, Compliance) on the same
-    # time basis so that Breached + Met <= Closed always holds.
-    n_breached = int((closed_recent_df["sla_label"] == "breached").sum())
-    p0_breach = int(((closed_recent_df["sla_label"] == "breached") & (closed_recent_df["priority"] == "P0")).sum())
-    p1_breach = int(((closed_recent_df["sla_label"] == "breached") & (closed_recent_df["priority"] == "P1")).sum())
+    breached_df = closed_recent_df[closed_recent_df["sla_label"] == "breached"].copy()
+    met_df      = closed_recent_df[closed_recent_df["sla_label"] == "met"].copy()
+
+    n_breached = len(breached_df)
+    p0_breach = int(((breached_df["priority"] == "P0")).sum())
+    p1_breach = int(((breached_df["priority"] == "P1")).sum())
     period_tracked = closed_recent_df[closed_recent_df["sla_label"].isin(["on_track", "at_risk", "breached", "met"])]
     _n_pt = len(period_tracked)
     compliance_pct = round(
         int((period_tracked["sla_label"].isin(["on_track", "at_risk", "met"])).sum()) / _n_pt * 100, 1
     ) if _n_pt else 100.0
 
-    if compliance_pct >= 95:
-        comp_accent = COLOR["green_fill"]
-    elif compliance_pct >= 80:
-        comp_accent = COLOR["amber_fill"]
-    else:
-        comp_accent = COLOR["red_fill"]
-
+    comp_accent = (
+        COLOR["green_fill"] if compliance_pct >= 95
+        else (COLOR["amber_fill"] if compliance_pct >= 80 else COLOR["red_fill"])
+    )
     met_secondary = f"n={n_closed} closed · {met_pct}%" if n_closed else "No closures"
 
-    # WoW deltas — each tuple: (diff, unit, invert_polarity)
     prev_avg = prev_snap.get("avg_resolution_days")
     avg_diff = (avg_days_num - prev_avg) if (avg_days_num is not None and prev_avg is not None) else None
     deltas = {
-        "open":       (n_open - prev_snap["open"],            "",  True),
-        "at_risk":    (n_at_risk - prev_snap["at_risk"],      "",  True),
-        "breached":   (n_breached - prev_snap["breached"],    "",  True),
-        "met":        (n_met - prev_snap["met"],              "",  False),
-        "avg":        (avg_diff,                              "d", True),
-        "compliance": (compliance_pct - prev_snap["compliance_pct"], "%", False),
+        "open":       (n_open     - prev_snap.get("open", 0),              "",  True),
+        "reported":   (n_reported - prev_snap.get("reported", 0),          "",  True),
+        "compliance": (compliance_pct - prev_snap.get("compliance_pct", 100.0), "%", False),
+        "breached":   (n_breached - prev_snap.get("breached", 0),          "",  True),
+        "met":        (n_met      - prev_snap.get("met", 0),               "",  False),
+        "avg":        (avg_diff,                                            "d", True),
     }
 
-    live_scope = "live · all open"
+    live_scope   = "live · all open"
     period_scope = f"{start_date.strftime('%d %b')} – {end_date.strftime('%d %b %Y')}"
 
-    tiles = [
-        ("Open defects",    live_scope,    str(n_open),              "Not yet Closed",                              COLOR["text_secondary"], "open"),
-        ("At risk",         live_scope,    str(n_at_risk),           f"Top: {top_at_risk}",                         COLOR["amber_fill"],     "at_risk"),
-        ("SLA breached",    period_scope,  str(n_breached),          f"{p0_breach}× P0 · {p1_breach}× P1",          COLOR["red_fill"],       "breached"),
-        ("SLA met",         period_scope,  str(n_met),               met_secondary,                                 COLOR["green_fill"],     "met"),
-        ("Avg resolution",  period_scope,  avg_resolution,           f"n={n_closed} closed",                        COLOR["text_secondary"], "avg"),
-        ("SLA compliance",  period_scope,  f"{compliance_pct:.0f}%", "Target: 95%",                                 comp_accent,             "compliance"),
+    # Tile tuple: (label, scope, value, secondary, accent, delta_key, btn_key, popup_func, popup_df)
+    # btn_key=None means the card is not clickable.
+    row1 = [
+        ("Open defects",   live_scope,   str(n_open),              "Not yet closed",    COLOR["text_secondary"], "open",       "btn_open_popup",     _show_open_dialog,     open_df),
+        ("Reported",       period_scope, str(n_reported),          "created in period", COLOR["accent"],         "reported",   "btn_reported_popup", _show_reported_dialog, reported_df),
+        ("SLA compliance", period_scope, f"{compliance_pct:.0f}%", "Target: 95%",       comp_accent,             "compliance", None,                 None,                  None),
+    ]
+    row2 = [
+        ("SLA breached",   period_scope, str(n_breached),  f"{p0_breach}× P0 · {p1_breach}× P1", COLOR["red_fill"],       "breached", "btn_breached_popup", _show_breached_dialog, breached_df),
+        ("SLA met",        period_scope, str(n_met),       met_secondary,                          COLOR["green_fill"],     "met",      "btn_met_popup",      _show_met_dialog,      met_df),
+        ("Avg resolution", period_scope, avg_resolution,   f"n={n_closed} closed",                 COLOR["text_secondary"], "avg",      None,                 None,                  None),
     ]
 
-    cols = st.columns(6)
-    for col, (label, scope, value, secondary, accent, delta_key) in zip(cols, tiles):
-        diff, unit, invert = deltas[delta_key]
-        delta_text, delta_bg, delta_fg = _fmt_wow_delta(diff, unit, invert)
-        delta_html = (
-            f'<div style="display:inline-block;background:{delta_bg};border-radius:10px;'
-            f'padding:2px 8px;font-size:10px;color:{delta_fg};font-weight:600;margin-bottom:6px">'
-            f'{delta_text} <span style="opacity:.7;font-weight:500">vs 7d ago</span></div>'
-        )
-        with col:
-            st.markdown(f"""
-<div style="background:{COLOR["card_bg"]};border-radius:12px;padding:20px 18px;
+    def _render_row(tiles: list) -> None:
+        cols = st.columns(3)
+        for col, (label, scope, value, secondary, accent, delta_key, btn_key, popup_func, popup_df) in zip(cols, tiles):
+            diff, unit, invert = deltas[delta_key]
+            delta_text, delta_bg, delta_fg = _fmt_wow_delta(diff, unit, invert)
+            delta_html = (
+                f'<div style="display:inline-block;background:{delta_bg};border-radius:10px;'
+                f'padding:2px 7px;font-size:10px;color:{delta_fg};font-weight:600;margin-bottom:4px">'
+                f'{delta_text} <span style="opacity:.7;font-weight:500">vs 7d ago</span></div>'
+            )
+            with col:
+                st.markdown(f"""
+<div style="background:{COLOR["card_bg"]};border-radius:12px;padding:14px 16px;
             border:1px solid {COLOR["border"]};border-top:3px solid {accent};
             box-shadow:0 1px 4px rgba(0,0,0,.06)">
   <div style="font-size:11px;color:{COLOR["text_secondary"]};letter-spacing:.07em;
               text-transform:uppercase;font-weight:600;margin-bottom:2px">{label}</div>
   <div style="font-size:9px;color:{COLOR["text_tertiary"]};letter-spacing:.05em;
-              font-weight:500;margin-bottom:10px">{scope}</div>
-  <div style="font-size:32px;font-weight:700;color:{COLOR["text_primary"]};
-              line-height:1;margin-bottom:8px;letter-spacing:-.02em">{value}</div>
+              font-weight:500;margin-bottom:6px">{scope}</div>
+  <div style="font-size:26px;font-weight:700;color:{COLOR["text_primary"]};
+              line-height:1;margin-bottom:6px;letter-spacing:-.02em">{value}</div>
   {delta_html}
-  <div style="font-size:12px;color:{COLOR["text_secondary"]};font-weight:500">{secondary}</div>
+  <div style="font-size:11px;color:{COLOR["text_secondary"]};font-weight:500">{secondary}</div>
 </div>
 """, unsafe_allow_html=True)
+                if btn_key:
+                    if st.button(" ", key=btn_key, use_container_width=True):
+                        popup_func(popup_df, jira_domain)
+
+    _render_row(row1)
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    _render_row(row2)
 
 
 def _render_priority_bars(open_df: pd.DataFrame) -> None:
@@ -1795,17 +1852,76 @@ def _render_monthly_trend(all_df: pd.DataFrame, now: datetime) -> None:
         )
 
 
-def _render_trend_footer(all_df: pd.DataFrame, start: date, end: date) -> None:
-    """Flow summary for the selected date range: reported, closed, net backlog, oldest open."""
-    created = all_df["created"].dt.date
-    resolved = all_df["resolved"].dt.date
-    in_range_created = (created >= start) & (created <= end)
+@st.dialog("Open defects", width="large")
+def _show_open_dialog(open_df: pd.DataFrame, jira_domain: str) -> None:
+    n = len(open_df)
+    if n == 0:
+        st.info("No open defects.")
+        return
+    st.caption(f"{n} open defect{'s' if n != 1 else ''} — sorted by SLA severity.")
+    _render_ticket_table(
+        open_df.sort_values("sla_pct", ascending=False),
+        jira_domain,
+        showing_closed=False,
+    )
+
+
+@st.dialog("Reported defects", width="large")
+def _show_reported_dialog(reported_df: pd.DataFrame, jira_domain: str) -> None:
+    n = len(reported_df)
+    if n == 0:
+        st.info("No defects reported in this period.")
+        return
+    st.caption(f"{n} defect{'s' if n != 1 else ''} created in the selected period — sorted newest first.")
+    _render_ticket_table(
+        reported_df.sort_values("created", ascending=False),
+        jira_domain,
+        showing_closed=True,
+    )
+
+
+@st.dialog("SLA breached", width="large")
+def _show_breached_dialog(breached_df: pd.DataFrame, jira_domain: str) -> None:
+    n = len(breached_df)
+    if n == 0:
+        st.info("No SLA breaches in this period.")
+        return
+    st.caption(f"{n} ticket{'s' if n != 1 else ''} breached SLA — sorted by priority.")
+    _render_ticket_table(
+        breached_df.sort_values(["priority", "resolved"], ascending=[True, False]),
+        jira_domain,
+        showing_closed=True,
+    )
+
+
+@st.dialog("SLA met", width="large")
+def _show_met_dialog(met_df: pd.DataFrame, jira_domain: str) -> None:
+    n = len(met_df)
+    if n == 0:
+        st.info("No tickets resolved within SLA in this period.")
+        return
+    st.caption(f"{n} ticket{'s' if n != 1 else ''} resolved within SLA — sorted newest first.")
+    _render_ticket_table(
+        met_df.sort_values("resolved", ascending=False),
+        jira_domain,
+        showing_closed=True,
+    )
+
+
+def _render_trend_footer(all_df: pd.DataFrame, start: date, end: date,
+                         jira_domain: str) -> None:
+    """Compact period-activity strip rendered below the KPI tiles."""
+    created_dates = all_df["created"].dt.date
+    resolved_dates = all_df["resolved"].dt.date
+    in_range_created = (created_dates >= start) & (created_dates <= end)
     in_range_closed = (
         (all_df["status"].str.lower() == "closed")
         & all_df["resolved"].notna()
-        & (resolved >= start) & (resolved <= end)
+        & (resolved_dates >= start) & (resolved_dates <= end)
     )
-    reported = int(in_range_created.sum())
+
+    reported_df = all_df[in_range_created].copy()
+    reported = len(reported_df)
     closed = int(in_range_closed.sum())
     net = reported - closed
     open_all = all_df[all_df["status"].str.lower() != "closed"]
@@ -1813,50 +1929,51 @@ def _render_trend_footer(all_df: pd.DataFrame, start: date, end: date) -> None:
 
     net_color = COLOR["red_fill"] if net > 0 else COLOR["green_fill"]
     net_icon = "▲" if net > 0 else ("▼" if net < 0 else "•")
-
+    net_str = f"{net_icon} {'+' if net > 0 else ''}{net}"
     range_label = f"{start.strftime('%d %b')} – {end.strftime('%d %b %Y')}"
 
-    cells = [
-        ("Reported", str(reported), COLOR["text_primary"], "🆕", "tickets opened"),
-        ("Closed", str(closed), COLOR["text_primary"], "✓", "tickets resolved"),
-        ("Net backlog", f"{net_icon} {'+' if net > 0 else ''}{net}", net_color, "", "reported − closed"),
-        ("Oldest open", f"{oldest_age}d", COLOR["text_primary"], "⏱", "longest aging ticket"),
-    ]
+    chip = (
+        f"background:{COLOR['page_bg']};border:1px solid {COLOR['border']};"
+        f"border-radius:8px;padding:7px 14px;font-size:12px;"
+        f"color:{COLOR['text_secondary']};font-weight:500;text-align:center"
+    )
 
-    cells_html = ""
-    for i, (label, value, color, icon, caption) in enumerate(cells):
-        divider = (
-            f"border-right:1px solid {COLOR['border']};" if i < len(cells) - 1 else ""
-        )
-        icon_html = (
-            f'<span style="font-size:13px;margin-right:4px;opacity:.7">{icon}</span>'
-            if icon else ""
-        )
-        cells_html += f"""
-<div style="flex:1;padding:16px 18px;{divider}">
-  <div style="font-size:11px;color:{COLOR["text_secondary"]};letter-spacing:.08em;
-              text-transform:uppercase;font-weight:600;margin-bottom:8px">
-    {icon_html}{label}
-  </div>
-  <div style="font-size:28px;font-weight:700;color:{color};line-height:1;
-              letter-spacing:-0.5px">{value}</div>
-  <div style="font-size:11px;color:{COLOR["text_secondary"]};margin-top:6px">{caption}</div>
-</div>"""
+    col_rep, col_closed, col_net, col_oldest, col_spacer = st.columns([1, 1, 1, 1, 3])
 
-    st.markdown(f"""
-<div style="background:{COLOR["card_bg"]};border:1px solid {COLOR["border"]};
-            border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,.06);overflow:hidden">
-  <div style="padding:10px 18px;background:#f8fafc;border-bottom:1px solid {COLOR["border"]};
-              display:flex;align-items:center;justify-content:space-between">
-    <span style="font-size:12px;font-weight:600;color:{COLOR["text_primary"]};
-                 letter-spacing:.04em">Period activity</span>
-    <span style="font-size:11px;color:{COLOR["text_secondary"]};font-weight:500">{range_label}</span>
-  </div>
-  <div style="display:flex;align-items:stretch">
-    {cells_html}
-  </div>
-</div>
-""", unsafe_allow_html=True)
+    with col_rep:
+        if st.button(
+            f"🆕 Reported   {reported}",
+            key="btn_reported_popup",
+            use_container_width=True,
+            help="Click to view all defects reported in this period",
+        ):
+            _show_reported_dialog(reported_df, jira_domain)
+
+    with col_closed:
+        st.markdown(
+            f'<div style="{chip}">✓ Closed &nbsp;<strong style="color:{COLOR["text_primary"]}">{closed}</strong></div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_net:
+        st.markdown(
+            f'<div style="{chip}">Net &nbsp;<strong style="color:{net_color}">{net_str}</strong></div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_oldest:
+        st.markdown(
+            f'<div style="{chip}">⏱ Oldest &nbsp;<strong style="color:{COLOR["text_primary"]}">{oldest_age}d</strong></div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_spacer:
+        st.markdown(
+            f'<div style="display:flex;justify-content:flex-end;align-items:center;height:100%">'
+            f'<span style="font-size:11px;color:{COLOR["text_tertiary"]};font-style:italic">'
+            f'Period: {range_label}</span></div>',
+            unsafe_allow_html=True,
+        )
 
 
 def _render_raw_expander(df: pd.DataFrame, filtered_view: pd.DataFrame) -> None:
@@ -2075,25 +2192,25 @@ def main() -> None:
     # the "Period Activity" footer (Reported / Closed counts).
     open_df = open_df_all
 
+    # Reported defects in the selected period — passed to _render_kpi_cards for the dialog.
+    reported_df = derived_df[
+        derived_df["created"].notna()
+        & (derived_df["created"].dt.date >= start_date)
+        & (derived_df["created"].dt.date <= end_date)
+    ].copy()
+
     st.markdown(
         f"<div style='height:1px;background:linear-gradient(90deg,{COLOR['accent']},transparent);"
         f"margin:12px 0 16px'></div>",
         unsafe_allow_html=True,
     )
 
-    # Overall health status + executive summary
-    _render_health_banner(open_df, closed_recent_df, start_date, end_date)
-
     # Section 1: KPI tiles (with week-over-week delta pills)
     prev_snap = _kpi_snapshot_at(
         derived_df, start_date, end_date, now - timedelta(days=7),
     )
-    _render_kpi_cards(open_df, closed_recent_df, prev_snap, start_date, end_date)
-
-    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-
-    # Period activity summary (reflects the selected date range)
-    _render_trend_footer(derived_df, start_date, end_date)
+    _render_kpi_cards(open_df, closed_recent_df, prev_snap, start_date, end_date,
+                      derived_df, jira_domain, reported_df)
 
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
