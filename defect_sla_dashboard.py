@@ -99,6 +99,48 @@ PRIORITY_RE = re.compile(r"\bP[0-3]\b")
 
 JIRA_LABEL = "MedLern_Client_Reported"
 
+REQUIRED_JIRA_SECRETS = [
+    "JIRA_DOMAIN",
+    "JIRA_EMAIL",
+    "JIRA_API_TOKEN",
+    "JIRA_DEFECT_FILTER_ID",
+]
+
+
+def _get_secret_value(key: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(key, default)
+    except Exception:
+        return default
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def validate_jira_config() -> tuple[list[str], dict[str, str]]:
+    config = {key: _get_secret_value(key) for key in REQUIRED_JIRA_SECRETS}
+    missing = [key for key, value in config.items() if not value]
+    return missing, config
+
+
+def render_missing_config(missing_keys: list[str]) -> None:
+    st.error("Jira configuration is incomplete.")
+    st.markdown(
+        f"""
+<div style="background:{COLOR["card_bg"]};border:1px solid {COLOR["border"]};
+            border-radius:8px;padding:16px 18px;margin-top:8px">
+  <div style="font-size:14px;font-weight:700;color:{COLOR["text_primary"]};margin-bottom:8px">
+    Missing required Streamlit secrets
+  </div>
+  <div style="font-size:13px;color:{COLOR["text_secondary"]};margin-bottom:12px">
+    Add these values to local Streamlit secrets or the deployment configuration before loading Jira data.
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    st.code("\n".join(missing_keys), language="text")
+
 
 # =====================
 # Jira fetch helpers (pattern copied from dashboard.py — kept local on purpose)
@@ -530,12 +572,18 @@ def build_derived(df: pd.DataFrame, now: datetime) -> pd.DataFrame:
     out["client"] = [c[0] for c in client_rows]
     out["extraction_source"] = [c[1] for c in client_rows]
 
-    def _age(created: Any) -> float:
+    def _age(row: pd.Series) -> float:
+        created = row.get("created")
         if pd.isna(created):
             return 0.0
-        return (now - created.to_pydatetime()).total_seconds() / 86400
+        is_closed = str(row.get("status") or "").strip().lower() == "closed"
+        resolved = row.get("resolved")
+        end = resolved if (is_closed and pd.notna(resolved)) else now
+        created_dt = created.to_pydatetime() if hasattr(created, "to_pydatetime") else created
+        end_dt = end.to_pydatetime() if hasattr(end, "to_pydatetime") else end
+        return max(0.0, (end_dt - created_dt).total_seconds() / 86400)
 
-    out["age_days"] = out["created"].apply(_age)
+    out["age_days"] = out.apply(_age, axis=1)
     return out
 
 
@@ -643,10 +691,12 @@ hr {{ border-color: {COLOR["border"]} !important; margin: 1.5rem 0 !important; }
 /* Clickable KPI cards — transparent overlay button, position:absolute so it
    takes zero space in normal flow and matches the card's exact dimensions. */
 div:has(> :is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+              .st-key-btn_closed_popup,
               .st-key-btn_breached_popup, .st-key-btn_met_popup)) {{
     position: relative !important;
 }}
 :is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+    .st-key-btn_closed_popup,
     .st-key-btn_breached_popup, .st-key-btn_met_popup) {{
     position: absolute !important;
     top: 0 !important; left: 0 !important;
@@ -656,11 +706,13 @@ div:has(> :is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
     pointer-events: none !important;
 }}
 :is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+    .st-key-btn_closed_popup,
     .st-key-btn_breached_popup, .st-key-btn_met_popup) > div {{
     height: 100% !important;
     margin: 0 !important;
 }}
 :is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+    .st-key-btn_closed_popup,
     .st-key-btn_breached_popup, .st-key-btn_met_popup) > div > button {{
     height: 100% !important;
     width: 100% !important;
@@ -674,6 +726,7 @@ div:has(> :is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
     pointer-events: auto !important;
 }}
 :is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+    .st-key-btn_closed_popup,
     .st-key-btn_breached_popup, .st-key-btn_met_popup) > div > button:hover {{
     background: transparent !important;
 }}
@@ -734,7 +787,8 @@ def _get_period_bounds(period_type: str, today: date) -> tuple[date, date]:
 def _render_header_bar(jira_domain: str, total_open: int, fetched_at: datetime,
                        today: date) -> tuple[date, date]:
     """Top header bar. Returns (start_date, end_date)."""
-    now_str = datetime.now(IST).strftime("%d %b %Y · %H:%M %Z")
+    render_str = datetime.now(IST).strftime("%d %b %Y · %H:%M %Z")
+    sync_str = fetched_at.strftime("%d %b %Y · %H:%M %Z")
 
     st.markdown(f"""
 <div style="display:flex;align-items:center;gap:14px;padding:8px 0 4px">
@@ -745,7 +799,7 @@ def _render_header_bar(jira_domain: str, total_open: int, fetched_at: datetime,
     <div style="font-size:22px;font-weight:700;color:{COLOR["text_primary"]};
                 letter-spacing:-0.3px;line-height:1.2">Client defect SLA tracker</div>
     <div style="font-size:12px;color:{COLOR["text_secondary"]};margin-top:2px">
-      MDLRN · {total_open} client-reported defects · Last sync {now_str}
+      MDLRN · {total_open} open client-reported defects · Data sync {sync_str}
     </div>
   </div>
 </div>
@@ -772,13 +826,12 @@ def _render_header_bar(jira_domain: str, total_open: int, fetched_at: datetime,
             st.cache_data.clear()
             st.rerun()
     with c3:
-        fetched_str = fetched_at.strftime("%d %b %H:%M %Z")
         st.markdown(
             f'<div style="display:flex;justify-content:flex-end;align-items:center;height:100%">'
             f'<span style="background:#f1f5f9;border:1px solid {COLOR["border"]};'
             f'border-radius:20px;padding:4px 12px;font-size:12px;'
             f'color:{COLOR["text_secondary"]};font-weight:500;white-space:nowrap">'
-            f'🕐 Data from {fetched_str}</span></div>',
+            f'🕐 Rendered {render_str}</span></div>',
             unsafe_allow_html=True,
         )
 
@@ -1095,33 +1148,47 @@ def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
         COLOR["green_fill"] if compliance_pct >= 95
         else (COLOR["amber_fill"] if compliance_pct >= 80 else COLOR["red_fill"])
     )
-    met_secondary = f"n={n_closed} closed · {met_pct}%" if n_closed else "No closures"
+    met_secondary = (
+        f"{n_met} of {n_closed} resolved within SLA ({met_pct}%)"
+        if n_closed else "No resolved defects in period"
+    )
 
     prev_avg = prev_snap.get("avg_resolution_days")
     avg_diff = (avg_days_num - prev_avg) if (avg_days_num is not None and prev_avg is not None) else None
     deltas = {
         "open":       (n_open     - prev_snap.get("open", 0),              "",  True),
         "reported":   (n_reported - prev_snap.get("reported", 0),          "",  True),
+        "closed":     (n_closed   - prev_snap.get("closed", 0),            "",  False),
         "compliance": (compliance_pct - prev_snap.get("compliance_pct", 100.0), "%", False),
         "breached":   (n_breached - prev_snap.get("breached", 0),          "",  True),
         "met":        (n_met      - prev_snap.get("met", 0),               "",  False),
-        "avg":        (avg_diff,                                            "d", True),
     }
 
     live_scope   = "live · all open"
     period_scope = f"{start_date.strftime('%d %b')} – {end_date.strftime('%d %b %Y')}"
+    created_scope = f"created · {period_scope}"
+    resolved_scope = f"resolved · {period_scope}"
 
     # Tile tuple: (label, scope, value, secondary, accent, delta_key, btn_key, popup_func, popup_df)
     # btn_key=None means the card is not clickable.
+    closed_secondary = (
+        f"{n_met} within SLA · {n_breached} breached"
+        if n_closed else "No resolved defects in period"
+    )
     row1 = [
-        ("Open defects",   live_scope,   str(n_open),              "Not yet closed",    COLOR["text_secondary"], "open",       "btn_open_popup",     _show_open_dialog,     open_df),
-        ("Reported",       period_scope, str(n_reported),          "created in period", COLOR["accent"],         "reported",   "btn_reported_popup", _show_reported_dialog, reported_df),
-        ("SLA compliance", period_scope, f"{compliance_pct:.0f}%", "Target: 95%",       comp_accent,             "compliance", None,                 None,                  None),
+        ("Open defects",   live_scope,     str(n_open),              "All open, any created date",       COLOR["text_secondary"], "open",       "btn_open_popup",     _show_open_dialog,     open_df),
+        ("Reported",       created_scope,  str(n_reported),          "Created in selected period",       COLOR["accent"],         "reported",   "btn_reported_popup", _show_reported_dialog, reported_df),
+        ("Closed",         resolved_scope, str(n_closed),            closed_secondary,                   COLOR["text_secondary"], "closed",     "btn_closed_popup",   _show_closed_dialog,   closed_recent_df),
     ]
+    breach_parts = [f"{p0_breach} P0" if p0_breach else None, f"{p1_breach} P1" if p1_breach else None]
+    breach_secondary = (
+        " · ".join(p for p in breach_parts if p) + " critical"
+        if any(breach_parts) else "No P0 or P1 breaches"
+    ) if n_breached else "No breaches in period"
     row2 = [
-        ("SLA breached",   period_scope, str(n_breached),  f"{p0_breach}× P0 · {p1_breach}× P1", COLOR["red_fill"],       "breached", "btn_breached_popup", _show_breached_dialog, breached_df),
-        ("SLA met",        period_scope, str(n_met),       met_secondary,                          COLOR["green_fill"],     "met",      "btn_met_popup",      _show_met_dialog,      met_df),
-        ("Avg resolution", period_scope, avg_resolution,   f"n={n_closed} closed",                 COLOR["text_secondary"], "avg",      None,                 None,                  None),
+        ("SLA breached",   resolved_scope, str(n_breached),  breach_secondary,                                       COLOR["red_fill"],       "breached", "btn_breached_popup", _show_breached_dialog, breached_df),
+        ("SLA met",        resolved_scope, str(n_met),       met_secondary,                                          COLOR["green_fill"],     "met",      "btn_met_popup",      _show_met_dialog,      met_df),
+        ("SLA compliance", resolved_scope, f"{compliance_pct:.0f}%", "Closed in period · target 95%",               comp_accent,             "compliance", None,               None,                  None),
     ]
 
     def _render_row(tiles: list) -> None:
@@ -1348,56 +1415,31 @@ def _pill(text: str, bg: str, fg: str, mono: bool = False) -> str:
     )
 
 
-def _render_chip_filters(open_df: pd.DataFrame, closed_met_df: pd.DataFrame) -> str:
-    """Filter chips; returns the active chip key."""
-    n_all = len(open_df)
-    yesterday = datetime.now(IST).date() - timedelta(days=1)
-    if open_df.empty:
-        n_fresh = 0
-    else:
-        n_fresh = int((open_df["created"].dt.date >= yesterday).sum())
-    n_breach = int((open_df["sla_label"] == "breached").sum())
-    n_risk = int((open_df["sla_label"] == "at_risk").sum())
-    n_met = len(closed_met_df)
-    n_p0 = int((open_df["priority"] == "P0").sum())
-
-    chips = [
-        ("all",      f"All ({n_all})"),
-        ("fresh",    f"🆕 Today + Yesterday ({n_fresh})"),
-        ("breached", f"Breached ({n_breach})"),
-        ("at_risk",  f"At risk ({n_risk})"),
-        ("met",      f"SLA met ({n_met})"),
-        ("p0",       f"P0 ({n_p0})"),
-    ]
-
-    active = st.session_state.get("chip_filter", "all")
-
-    cols = st.columns(len(chips) + 2)
-    for (key, label), col in zip(chips, cols[:len(chips)]):
-        with col:
-            is_active = (key == active)
-            btn_key = f"chip_{key}"
-            if st.button(label, key=btn_key,
-                         use_container_width=True,
-                         type=("primary" if is_active else "secondary")):
-                st.session_state["chip_filter"] = key
-                st.rerun()
-    return active
+def _fmt_sla_duration(value: float, unit: str) -> str:
+    value = max(float(value or 0), 0.0)
+    if unit == "h":
+        return f"{value:.1f}h" if value < 10 and value % 1 else f"{value:.0f}h"
+    if unit == "wd":
+        return f"{value:.1f}wd"
+    return "—"
 
 
-def _apply_chip_filter(df: pd.DataFrame, chip: str) -> pd.DataFrame:
-    if chip == "fresh":
-        if df.empty:
-            return df
-        yesterday = datetime.now(IST).date() - timedelta(days=1)
-        return df[df["created"].dt.date >= yesterday]
-    if chip == "breached":
-        return df[df["sla_label"] == "breached"]
-    if chip == "at_risk":
-        return df[df["sla_label"] == "at_risk"]
-    if chip == "p0":
-        return df[df["priority"] == "P0"]
-    return df
+def _sla_time_caption(row: pd.Series) -> str:
+    unit = row.get("sla_unit", "")
+    budget = float(row.get("sla_budget", 0) or 0)
+    elapsed = float(row.get("sla_elapsed", 0) or 0)
+    if not unit or budget <= 0:
+        return ""
+
+    label = row.get("sla_label", "")
+    delta = budget - elapsed
+    if label == "breached":
+        return f"breached by {_fmt_sla_duration(abs(delta), unit)}"
+    if label in ("at_risk", "on_track"):
+        return f"{_fmt_sla_duration(delta, unit)} remaining"
+    if label == "met":
+        return f"{_fmt_sla_duration(delta, unit)} headroom"
+    return ""
 
 
 def _render_ticket_table(open_df: pd.DataFrame, jira_domain: str,
@@ -1482,10 +1524,17 @@ def _render_ticket_table(open_df: pd.DataFrame, jira_domain: str,
             sla_bg, sla_fg, sla_text = "#dcfce7", "#15803d", f"✓ met · {pct}%"
         else:
             sla_bg, sla_fg, sla_text = "#f1f5f9", "#64748b", "—"
+        sla_caption = _sla_time_caption(r)
+        sla_caption_html = (
+            f'<span style="font-size:10px;color:{COLOR["text_secondary"]};white-space:nowrap">'
+            f'{sla_caption}</span>'
+            if sla_caption else ""
+        )
         sla_html = (
+            f'<div style="display:flex;flex-direction:column;gap:2px;white-space:nowrap">'
             f'<span style="background:{sla_bg};color:{sla_fg};padding:2px 10px;'
             f'border-radius:10px;font-size:11px;font-weight:700;white-space:nowrap">'
-            f'{sla_text}</span>'
+            f'{sla_text}</span>{sla_caption_html}</div>'
         )
 
         key_link = (
@@ -1880,6 +1929,20 @@ def _show_reported_dialog(reported_df: pd.DataFrame, jira_domain: str) -> None:
     )
 
 
+@st.dialog("Closed defects", width="large")
+def _show_closed_dialog(closed_df: pd.DataFrame, jira_domain: str) -> None:
+    n = len(closed_df)
+    if n == 0:
+        st.info("No defects resolved in this period.")
+        return
+    st.caption(f"{n} defect{'s' if n != 1 else ''} resolved in the selected period — sorted newest first.")
+    _render_ticket_table(
+        closed_df.sort_values("resolved", ascending=False),
+        jira_domain,
+        showing_closed=True,
+    )
+
+
 @st.dialog("SLA breached", width="large")
 def _show_breached_dialog(breached_df: pd.DataFrame, jira_domain: str) -> None:
     n = len(breached_df)
@@ -2151,11 +2214,16 @@ def main() -> None:
     )
     _inject_css()
 
+    missing_keys, jira_config = validate_jira_config()
+    if missing_keys:
+        render_missing_config(missing_keys)
+        st.stop()
+
     # Auto-refresh every 30 minutes. Cache TTL is 15 min, so each rerun refetches.
     st_autorefresh(interval=30 * 60 * 1000, key="defect_sla_autorefresh")
 
     now = datetime.now(IST)
-    jira_domain = st.secrets["JIRA_DOMAIN"]
+    jira_domain = jira_config["JIRA_DOMAIN"]
 
     with st.spinner("Loading defects from Jira…"):
         raw_df, fetched_at = load_defect_data()
@@ -2206,6 +2274,11 @@ def main() -> None:
     )
 
     # Section 1: KPI tiles (with week-over-week delta pills)
+    period_label = f"{start_date.strftime('%d %b')} – {end_date.strftime('%d %b %Y')}"
+    _section_header(
+        "Executive KPIs",
+        f"Open defects is a live all-open snapshot. Reported uses created date; SLA breached/met and resolution use resolved date for {period_label}.",
+    )
     prev_snap = _kpi_snapshot_at(
         derived_df, start_date, end_date, now - timedelta(days=7),
     )
@@ -2229,13 +2302,8 @@ def main() -> None:
         "Open tickets",
         "Sorted by SLA breach severity (highest % consumed first)",
     )
-    closed_met_recent = closed_recent_df[closed_recent_df["sla_label"] == "met"]
-    chip = _render_chip_filters(open_df, closed_met_recent)
-    if chip == "met":
-        table_df = closed_met_recent.sort_values("resolved", ascending=False)
-    else:
-        table_df = _apply_chip_filter(open_df, chip)
-    _render_ticket_table(table_df, jira_domain, showing_closed=(chip == "met"))
+    table_df = open_df
+    _render_ticket_table(table_df, jira_domain)
     _render_stuck_workflow_callout(open_df, now)
 
     st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)

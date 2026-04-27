@@ -17,6 +17,17 @@ COMPLETED_STATUSES = ["ACCEPTED IN QA", "CLOSED"]
 SP_BASELINE_PER_DAY = 1          # 5 SP/week baseline
 PROD_GREEN_THRESHOLD = 80        # productivity % → green
 PROD_YELLOW_THRESHOLD = 60       # productivity % → yellow, else red
+QUALITY_GREEN_THRESHOLD = 80
+QUALITY_YELLOW_THRESHOLD = 60
+HIGH_BUG_COUNT_THRESHOLD = 3
+
+REQUIRED_JIRA_SECRETS = [
+    "JIRA_DOMAIN",
+    "JIRA_EMAIL",
+    "JIRA_API_TOKEN",
+    "JIRA_FILTER_ID",
+]
+OPTIONAL_BUG_FILTER_SECRET = "JIRA_BUG_FILTER_ID"
 
 # Sprint structure — 2-week sprint has 10 calendar working days but only 7 dev days
 # (3 days are sprint ceremonies: planning, review, retro)
@@ -27,6 +38,60 @@ DEV_DAY_RATIO = SPRINT_DEV_DAYS / SPRINT_WORKING_DAYS   # 0.7
 # =====================
 # Data loading
 # =====================
+
+def _get_secret_value(key: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(key, default)
+    except Exception:
+        return default
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def validate_jira_config():
+    config = {key: _get_secret_value(key) for key in REQUIRED_JIRA_SECRETS}
+    missing = [key for key, value in config.items() if not value]
+    config[OPTIONAL_BUG_FILTER_SECRET] = _get_secret_value(OPTIONAL_BUG_FILTER_SECRET)
+    return missing, config
+
+
+def render_missing_config(missing_keys):
+    st.error("Jira configuration is incomplete.")
+    st.markdown(
+        """
+<div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;padding:16px 18px;margin-top:8px">
+  <div style="font-size:14px;font-weight:700;color:#0f172a;margin-bottom:8px">Missing required Streamlit secrets</div>
+  <div style="font-size:13px;color:#475569;margin-bottom:12px">
+    Add these values to local Streamlit secrets or the deployment configuration before loading Jira data.
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    st.code("\n".join(missing_keys), language="text")
+
+
+def _empty_task_df():
+    return pd.DataFrame(
+        columns=[
+            "Key",
+            "Summary",
+            "Status",
+            "Due Date",
+            "Story Points",
+            "Developer",
+            "Created",
+            "Is Completed",
+            "Week",
+            "Month",
+            "Quarter",
+        ]
+    )
+
+
+def _empty_bug_df():
+    return pd.DataFrame(columns=["Key", "Summary", "Created", "Developer", "Week", "Month", "Quarter"])
 
 @st.cache_data(ttl=14400, show_spinner=False)
 def _jira_search_all(jira_domain: str, email: str, token: str, jql: str, fields: str):
@@ -93,11 +158,8 @@ def _normalize_developer(dev_field):
 
 
 @st.cache_data(ttl=14400, show_spinner=False)
-def load_jira_data():
-    jira_domain = st.secrets["JIRA_DOMAIN"]
-    email = st.secrets["JIRA_EMAIL"]
-    token = st.secrets["JIRA_API_TOKEN"]
-    jql = f"filter={st.secrets['JIRA_FILTER_ID']}"
+def load_jira_data(jira_domain: str, email: str, token: str, filter_id: str):
+    jql = f"filter={filter_id}"
     fields = "key,summary,status,customfield_10988,customfield_10010,customfield_11012,created"
 
     try:
@@ -115,7 +177,13 @@ def load_jira_data():
                 "Created": f.get("created"),
             })
 
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(
+            data,
+            columns=["Key", "Summary", "Status", "Due Date", "Story Points", "Developer", "Created"],
+        )
+        if df.empty:
+            return _empty_task_df()
+
         for col in ["Key", "Summary", "Status", "Developer"]:
             df[col] = df[col].apply(_normalize_str)
 
@@ -133,15 +201,14 @@ def load_jira_data():
         return df
     except Exception as e:
         st.error(f"Failed to fetch Jira task data: {e}")
-        return pd.DataFrame()
+        return _empty_task_df()
 
 
 @st.cache_data(ttl=14400, show_spinner=False)
-def load_bug_data():
-    jira_domain = st.secrets["JIRA_DOMAIN"]
-    email = st.secrets["JIRA_EMAIL"]
-    token = st.secrets["JIRA_API_TOKEN"]
-    bug_filter_id = st.secrets.get("JIRA_BUG_FILTER_ID", "18484")
+def load_bug_data(jira_domain: str, email: str, token: str, bug_filter_id: str):
+    if not bug_filter_id:
+        return _empty_bug_df()
+
     jql = f"filter={bug_filter_id}"
     fields = "key,summary,created,customfield_11012"
 
@@ -157,7 +224,10 @@ def load_bug_data():
                 "Developer": _normalize_developer(f.get("customfield_11012")),
             })
 
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(rows, columns=["Key", "Summary", "Created", "Developer"])
+        if df.empty:
+            return _empty_bug_df()
+
         df["Created"] = pd.to_datetime(df["Created"], errors="coerce")
         df["Developer"] = df["Developer"].apply(_normalize_str).replace("", "(Unassigned)")
         df["Week"] = df["Created"].dt.to_period("W").dt.start_time
@@ -166,7 +236,7 @@ def load_bug_data():
         return df
     except Exception as e:
         st.error(f"Failed to fetch bug data: {e}")
-        return pd.DataFrame()
+        return _empty_bug_df()
 
 
 # =====================
@@ -184,12 +254,12 @@ def count_dev_days(start_dt, end_dt):
 
 def get_period_bounds(period_type: str, today: date):
     """Returns (start, end, prev_start, prev_end) as date objects."""
-    if period_type == "This Week":
+    if period_type == "Current Week":
         start = today - timedelta(days=today.weekday())
         end = start + timedelta(days=6)
         prev_start = start - timedelta(weeks=1)
         prev_end = prev_start + timedelta(days=6)
-    elif period_type == "This Month":
+    elif period_type == "Current Month":
         start = today.replace(day=1)
         if today.month == 12:
             end = date(today.year + 1, 1, 1) - timedelta(days=1)
@@ -202,7 +272,7 @@ def get_period_bounds(period_type: str, today: date):
         start = end.replace(day=1)
         prev_end = start - timedelta(days=1)
         prev_start = prev_end.replace(day=1)
-    elif period_type == "This Quarter":
+    elif period_type == "Current Quarter":
         q_month = 3 * ((today.month - 1) // 3) + 1
         start = date(today.year, q_month, 1)
         next_q_month = q_month + 3
@@ -221,6 +291,11 @@ def get_period_bounds(period_type: str, today: date):
         prev_end = start - timedelta(days=1)
         prev_q_month = 3 * ((prev_end.month - 1) // 3) + 1
         prev_start = date(prev_end.year, prev_q_month, 1)
+    elif period_type == "Current Year":
+        start = date(today.year, 1, 1)
+        end = date(today.year, 12, 31)
+        prev_start = date(today.year - 1, 1, 1)
+        prev_end = date(today.year - 1, 12, 31)
     else:
         start = today - timedelta(weeks=4)
         end = today
@@ -441,13 +516,15 @@ def _fmt_delta(diff, unit, invert):
 
 def render_kpi_cards(curr: dict, prev: dict):
     metrics_cfg = [
-        ("Active Devs",    "",  False, "#8b5cf6", "👥"),
+        ("Active Devs",    "",  False, "#8b5cf6", "DEV"),
+        ("Capacity SP",    "",  False, "#475569", "CAP"),
         ("Completed SP",   "",  False, "#6366f1", "SP"),
         ("Productivity %", "%", False, "#06b6d4", "%"),
-        ("Bugs",           "",  True,  "#f43f5e", "🐛"),
+        ("Bugs",           "",  True,  "#f43f5e", "BUG"),
+        ("Quality Score",  "",  False, "#10b981", "QS"),
     ]
 
-    cols = st.columns(4)
+    cols = st.columns(len(metrics_cfg))
     for col, (key, unit, invert, accent, icon) in zip(cols, metrics_cfg):
         val = curr.get(key, 0)
         prev_val = prev.get(key, 0) if prev else None
@@ -459,14 +536,34 @@ def render_kpi_cards(curr: dict, prev: dict):
 
         delta_color = "#16a34a" if is_pos is True else ("#dc2626" if is_pos is False else "#64748b")
         delta_bg    = "#dcfce7" if is_pos is True else ("#fee2e2" if is_pos is False else "#f1f5f9")
-        display_val = f"{val:.1f}%" if "%" in key else str(val)
+        display_val = f"{val:.1f}%" if "%" in key else str(int(round(val)))
 
         if key == "Active Devs":
-            cap = int(round(curr.get("Capacity SP", 0)))
             bottom_html = (
                 f'<div style="display:inline-block;background:#ede9fe;border-radius:20px;'
                 f'padding:3px 10px;font-size:11px;color:#8b5cf6;font-weight:600">'
-                f'{cap} SP capacity</div>'
+                f'contributors with assigned work</div>'
+            )
+        elif key == "Capacity SP":
+            bottom_html = (
+                f'<div style="display:inline-block;background:#f1f5f9;border-radius:20px;'
+                f'padding:3px 10px;font-size:11px;color:#475569;font-weight:600">'
+                f'dev-day baseline</div>'
+            )
+        elif key == "Completed SP":
+            cap = int(round(curr.get("Capacity SP", 0)))
+            display_val = str(int(round(val)))
+            bottom_html = (
+                f'<div style="display:inline-block;background:#eef2ff;border-radius:20px;'
+                f'padding:3px 10px;font-size:11px;color:#4f46e5;font-weight:600">'
+                f'{int(round(val))} / {cap} SP capacity</div>'
+            )
+        elif key == "Quality Score":
+            display_val = f'{int(round(val))}'
+            bottom_html = (
+                f'<div style="display:inline-block;background:{delta_bg};border-radius:20px;'
+                f'padding:3px 10px;font-size:11px;color:{delta_color};font-weight:600">'
+                f'{dstr} vs prev period</div>'
             )
         else:
             bottom_html = (
@@ -481,13 +578,13 @@ def render_kpi_cards(curr: dict, prev: dict):
             border:1px solid #e2e8f0;border-top:3px solid {accent};
             position:relative;overflow:hidden;
             box-shadow:0 1px 4px rgba(0,0,0,.06)">
-  <div style="position:absolute;top:14px;right:14px;width:32px;height:32px;
+  <div style="position:absolute;top:14px;right:14px;min-width:32px;height:32px;
               background:{accent}18;border-radius:8px;display:flex;
               align-items:center;justify-content:center;
-              font-size:13px;font-weight:700;color:{accent}">{icon}</div>
+              font-size:11px;font-weight:700;color:{accent};padding:0 6px">{icon}</div>
   <div style="font-size:11px;color:#64748b;letter-spacing:.07em;
               text-transform:uppercase;font-weight:600;margin-bottom:10px">{key}</div>
-  <div style="font-size:32px;font-weight:700;color:#0f172a;
+  <div style="font-size:28px;font-weight:700;color:#0f172a;
               line-height:1;margin-bottom:10px;letter-spacing:-.02em">{display_val}</div>
   {bottom_html}
 </div>""", unsafe_allow_html=True)
@@ -502,7 +599,7 @@ def render_dev_table(curr_dev: pd.DataFrame, prev_dev: pd.DataFrame):
         st.info("No data for the selected period.")
         return
 
-    df = curr_dev.copy().sort_values("Productivity %", ascending=False).reset_index(drop=True)
+    filtered = curr_dev.copy()
 
     def _badge(p):
         if p >= PROD_GREEN_THRESHOLD:
@@ -527,11 +624,11 @@ def render_dev_table(curr_dev: pd.DataFrame, prev_dev: pd.DataFrame):
     td = "padding:12px 16px;font-size:13px;color:#334155;border-bottom:1px solid #f1f5f9;vertical-align:middle"
 
     rows = ""
-    for i, (_, r) in enumerate(df.iterrows()):
+    for i, (_, r) in enumerate(filtered.iterrows()):
         bg = "#f8fafc" if i % 2 == 0 else "#ffffff"
         bug_clr = "#dc2626" if r["Bugs"] > 0 else "#94a3b8"
         q = r["Quality Score"]
-        q_clr = "#16a34a" if q >= 80 else ("#d97706" if q >= 60 else "#dc2626")
+        q_clr = "#16a34a" if q >= QUALITY_GREEN_THRESHOLD else ("#d97706" if q >= QUALITY_YELLOW_THRESHOLD else "#dc2626")
         rows += (
             f'<tr style="background:{bg}" '
             f'onmouseover="this.style.background=\'#eff6ff\'" '
@@ -567,7 +664,6 @@ def render_dev_table(curr_dev: pd.DataFrame, prev_dev: pd.DataFrame):
     <tbody>{rows}</tbody>
   </table>
 </div>""", unsafe_allow_html=True)
-
 
 # =====================
 # Developer drill-down
@@ -658,6 +754,7 @@ def render_dev_drilldown(
             combined = sp_hist.copy()
             combined["Bugs"] = 0
         combined["Bugs"] = combined["Bugs"].astype(int)
+        combined["Capacity SP"] = combined[gran].apply(lambda ts: _period_capacity_sp(ts, gran))
 
         base = alt.Chart(combined).encode(
             x=alt.X("Period Label:N", title=gran, sort=hist_order)
@@ -667,13 +764,18 @@ def render_dev_drilldown(
                     axis=alt.Axis(titleColor="#6366f1")),
             tooltip=["Period Label", "Story Points"],
         )
+        capacity_line = base.mark_line(color="#334155", strokeWidth=2, strokeDash=[6, 4]).encode(
+            y=alt.Y("Capacity SP:Q", title="Capacity SP",
+                    axis=alt.Axis(titleColor="#334155")),
+            tooltip=["Period Label", "Capacity SP"],
+        )
         bug_line = base.mark_line(point=True, color="#ef4444", strokeWidth=2, strokeDash=[4, 2]).encode(
             y=alt.Y("Bugs:Q", title="Bugs",
                     axis=alt.Axis(titleColor="#ef4444")),
             tooltip=["Period Label", "Bugs"],
         )
         hist_chart = (
-            alt.layer(sp_line, bug_line)
+            alt.layer(alt.layer(sp_line, capacity_line), bug_line)
             .resolve_scale(y="independent")
             .properties(height=240)
         )
@@ -733,6 +835,29 @@ def _fmt_period_label(ts, gran: str) -> str:
             return f"Q{((ts.month - 1)//3)+1}-{ts.year}"
     except Exception:
         return str(ts)
+
+
+def _period_capacity_sp(ts, gran: str) -> int:
+    if pd.isna(ts):
+        return 0
+
+    start = pd.Timestamp(ts).date()
+    if gran == "Week":
+        end = start + timedelta(days=6)
+    elif gran == "Month":
+        if start.month == 12:
+            end = date(start.year + 1, 1, 1) - timedelta(days=1)
+        else:
+            end = date(start.year, start.month + 1, 1) - timedelta(days=1)
+    else:
+        q_month = 3 * ((start.month - 1) // 3) + 1
+        next_q_month = q_month + 3
+        if next_q_month > 12:
+            end = date(start.year + 1, 1, 1) - timedelta(days=1)
+        else:
+            end = date(start.year, next_q_month, 1) - timedelta(days=1)
+
+    return int(round(max(count_dev_days(start, end) * SP_BASELINE_PER_DAY, 1)))
 
 
 # =====================
@@ -806,6 +931,12 @@ def render_share_section(period_label: str, team: dict, dev_df: pd.DataFrame):
 
     # Embed HTML as a JSON string so JS handles all escaping safely
     html_json = json.dumps(report_html)
+    download_html = (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<title>Team Productivity Report</title></head><body>"
+        f"{report_html}"
+        "</body></html>"
+    )
 
     components.html(f"""
 <button onclick="copyReport(this)"
@@ -830,66 +961,82 @@ function copyReport(btn) {{
   }}).catch(() => {{
     const msg = document.getElementById('msg');
     msg.style.color = '#ef4444';
-    msg.textContent = 'Copy failed — select the table below and use Ctrl+C';
+    msg.textContent = 'Copy failed - download HTML or select the preview below';
   }});
 }}
 </script>
 """, height=52)
 
+    st.download_button(
+        "Download HTML fallback",
+        data=download_html.encode("utf-8"),
+        file_name="team_productivity_report.html",
+        mime="text/html",
+    )
+
+    st.markdown("**Preview**")
+    st.markdown(
+        f"""
+<div style="background:#ffffff;border:1px solid #d9e2ec;border-radius:8px;padding:16px;overflow-x:auto">
+{report_html}
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
 
 
 # =====================
-# Raw tasks expander
+# Raw data
 # =====================
 
 def render_raw_data(df: pd.DataFrame, bugs_df: pd.DataFrame, default_start: date, default_end: date):
-    with st.expander("Raw Tasks & Bugs", expanded=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            raw_start = st.date_input("From", value=default_start, key="raw_start")
-        with col2:
-            raw_end = st.date_input("To", value=default_end, key="raw_end")
+    col1, col2 = st.columns(2)
+    with col1:
+        raw_start = st.date_input("From", value=default_start, key="raw_start")
+    with col2:
+        raw_end = st.date_input("To", value=default_end, key="raw_end")
 
-        all_devs = sorted(df["Developer"].dropna().unique())
-        sel_devs = st.multiselect("Filter by developer (optional)", all_devs)
+    all_devs = sorted(df["Developer"].dropna().unique())
+    sel_devs = st.multiselect("Filter by developer (optional)", all_devs)
 
-        tasks_f = df[
-            (df["Due Date"].dt.date >= raw_start) &
-            (df["Due Date"].dt.date <= raw_end)
+    tasks_f = df[
+        (df["Due Date"].dt.date >= raw_start) &
+        (df["Due Date"].dt.date <= raw_end)
+    ].copy()
+    tasks_f["Due Date"] = tasks_f["Due Date"].dt.strftime("%d-%b-%Y").str.upper()
+
+    if bugs_df is not None and not bugs_df.empty:
+        bugs_f = bugs_df[
+            (bugs_df["Created"].dt.date >= raw_start) &
+            (bugs_df["Created"].dt.date <= raw_end)
         ].copy()
-        tasks_f["Due Date"] = tasks_f["Due Date"].dt.strftime("%d-%b-%Y").str.upper()
+        bugs_f["Created"] = bugs_f["Created"].dt.strftime("%d-%b-%Y").str.upper()
+    else:
+        bugs_f = pd.DataFrame()
 
-        if bugs_df is not None and not bugs_df.empty:
-            bugs_f = bugs_df[
-                (bugs_df["Created"].dt.date >= raw_start) &
-                (bugs_df["Created"].dt.date <= raw_end)
-            ].copy()
-            bugs_f["Created"] = bugs_f["Created"].dt.strftime("%d-%b-%Y").str.upper()
-        else:
-            bugs_f = pd.DataFrame()
-
-        if sel_devs:
-            tasks_f = tasks_f[tasks_f["Developer"].isin(sel_devs)]
-            if not bugs_f.empty:
-                bugs_f = bugs_f[bugs_f["Developer"].isin(sel_devs)]
-
-        st.markdown("**Tasks**")
-        if not tasks_f.empty:
-            st.dataframe(
-                tasks_f[["Key", "Summary", "Developer", "Status", "Due Date", "Story Points"]],
-                use_container_width=True, hide_index=True,
-            )
-        else:
-            st.info("No tasks in this range.")
-
-        st.markdown("**Bugs**")
+    if sel_devs:
+        tasks_f = tasks_f[tasks_f["Developer"].isin(sel_devs)]
         if not bugs_f.empty:
-            st.dataframe(
-                bugs_f[["Key", "Summary", "Developer", "Created"]],
-                use_container_width=True, hide_index=True,
-            )
-        else:
-            st.info("No bugs in this range.")
+            bugs_f = bugs_f[bugs_f["Developer"].isin(sel_devs)]
+
+    st.markdown("**Tasks**")
+    if not tasks_f.empty:
+        st.dataframe(
+            tasks_f[["Key", "Summary", "Developer", "Status", "Due Date", "Story Points"]],
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.info("No tasks in this range.")
+
+    st.markdown("**Bugs**")
+    if not bugs_f.empty:
+        st.dataframe(
+            bugs_f[["Key", "Summary", "Developer", "Created"]],
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.info("No bugs in this range.")
 
 
 # =====================
@@ -924,11 +1071,16 @@ def main():
 </div>
 """, unsafe_allow_html=True)
 
+    missing_keys, jira_config = validate_jira_config()
+    if missing_keys:
+        render_missing_config(missing_keys)
+        st.stop()
+
     # ── Controls ────────────────────────────────────────────────────────
     with st.container():
         period_types = [
-            "This Week", "This Month", "Last Month",
-            "This Quarter", "Last Quarter", "Custom",
+            "Current Week", "Current Month", "Current Quarter", "Current Year",
+            "Last Month", "Last Quarter", "Custom",
         ]
         def _period_label(pt):
             if pt == "Custom":
@@ -943,7 +1095,7 @@ def main():
             selected_label = st.selectbox(
                 "Period",
                 period_labels,
-                index=2,          # default: Last Month
+                index=4,          # default: Last Month
                 label_visibility="collapsed",
             )
             period_type = period_types[period_labels.index(selected_label)]
@@ -960,6 +1112,24 @@ def main():
                 f'🕐 {now_str}</span></div>',
                 unsafe_allow_html=True,
             )
+
+        bug_config_note = (
+            "Bug metrics use Jira Created date from JIRA_BUG_FILTER_ID."
+            if jira_config[OPTIONAL_BUG_FILTER_SECRET]
+            else "Optional JIRA_BUG_FILTER_ID is not configured, so bug and quality metrics are shown without bug-filter data."
+        )
+        st.markdown(
+            f"""
+<div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin-top:8px">
+  <span style="font-size:12px;color:#475569;font-weight:600">Period semantics:</span>
+  <span style="font-size:12px;color:#64748b">
+    Task metrics use Jira Due Date. {bug_config_note}
+    Current periods are capped at {today.strftime('%d %b %Y')}. Capacity uses 7 dev days per 10 working days.
+  </span>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
 
         if period_type == "Custom":
             c1, c2, _ = st.columns([2, 2, 2])
@@ -983,8 +1153,18 @@ def main():
 
     # ── Load data ───────────────────────────────────────────────────────
     with st.spinner("Loading data from Jira…"):
-        df = load_jira_data()
-        bugs_df = load_bug_data()
+        df = load_jira_data(
+            jira_config["JIRA_DOMAIN"],
+            jira_config["JIRA_EMAIL"],
+            jira_config["JIRA_API_TOKEN"],
+            jira_config["JIRA_FILTER_ID"],
+        )
+        bugs_df = load_bug_data(
+            jira_config["JIRA_DOMAIN"],
+            jira_config["JIRA_EMAIL"],
+            jira_config["JIRA_API_TOKEN"],
+            jira_config[OPTIONAL_BUG_FILTER_SECRET],
+        )
 
     if df.empty:
         st.warning("No task data loaded. Check your Jira credentials and filter ID.")
@@ -996,33 +1176,30 @@ def main():
 
     DIVIDER = "<div style='height:1px;background:linear-gradient(90deg,#6366f1,transparent);margin:20px 0'></div>"
 
-    # ── Section 1: Team KPI cards ────────────────────────────────────────
-    _section_header("Team Overview", period_label)
-    render_kpi_cards(curr_team, prev_team)
+    overview_tab, drill_tab, raw_tab, share_tab = st.tabs(
+        ["Overview", "Developer Drill-Down", "Raw Data", "Share Report"]
+    )
 
-    st.markdown(DIVIDER, unsafe_allow_html=True)
+    with overview_tab:
+        _section_header("Team Overview", period_label)
+        render_kpi_cards(curr_team, prev_team)
 
-    # ── Section 2: Developer breakdown ───────────────────────────────────
-    _section_header("Developer Breakdown", "Individual performance metrics")
-    render_dev_table(curr_dev, prev_dev)
+        st.markdown(DIVIDER, unsafe_allow_html=True)
+        _section_header("Developer Breakdown", "Filtered individual performance metrics")
+        render_dev_table(curr_dev, prev_dev)
 
-    st.markdown(DIVIDER, unsafe_allow_html=True)
-
-    # ── Section 2b: Developer drill-down ─────────────────────────────────
-    with st.expander("Developer Drill-Down", expanded=False):
+    with drill_tab:
+        _section_header("Developer Drill-Down", "Single-developer trend, period tasks, and bugs")
         render_dev_drilldown(df, bugs_df, curr_dev, prev_dev, start_date, end_date)
 
-    st.markdown(DIVIDER, unsafe_allow_html=True)
+    with raw_tab:
+        _section_header("Raw Data", "Task and bug records for audit checks")
+        render_raw_data(df, bugs_df, start_date, end_date)
 
-    # ── Raw tasks (collapsed) ────────────────────────────────────────────
-    render_raw_data(df, bugs_df, start_date, end_date)
-
-    # ── Share Report ─────────────────────────────────────────────────────
-    st.markdown(DIVIDER, unsafe_allow_html=True)
-    _section_header("Share Report", "Copy Outlook-ready summary to clipboard")
-    st.markdown("<p style='font-size:12px;color:#64748b;margin-top:-8px;margin-bottom:12px'>Click the button below to copy the formatted table — paste directly into Outlook or any email client.</p>", unsafe_allow_html=True)
-
-    render_share_section(period_label, curr_team, curr_dev)
+    with share_tab:
+        _section_header("Share Report", "Copy Outlook-ready summary or download the generated HTML")
+        st.markdown("<p style='font-size:12px;color:#64748b;margin-top:-8px;margin-bottom:12px'>Use the formatted preview below for email review before sharing.</p>", unsafe_allow_html=True)
+        render_share_section(period_label, curr_team, curr_dev)
 
 
 if __name__ == "__main__":
