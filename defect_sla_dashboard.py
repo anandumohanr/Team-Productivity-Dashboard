@@ -1263,11 +1263,13 @@ def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
         " · ".join(p for p in breach_parts if p) + " critical"
         if any(breach_parts) else "No P0 or P1 breaches"
     ) if n_breached else "No breaches in period"
-    row2 = [
-        ("SLA breached",   resolved_scope, str(n_breached),  breach_secondary,                                       COLOR["red_fill"],       "breached", "btn_breached_popup", _show_breached_dialog, breached_df),
-        ("SLA met",        resolved_scope, str(n_met),       met_secondary,                                          COLOR["green_fill"],     "met",      "btn_met_popup",      _show_met_dialog,      met_df),
-        ("SLA compliance", resolved_scope, f"{compliance_pct:.0f}%", "Closed in period · target 95%",               comp_accent,             "compliance", None,               None,                  None),
-    ]
+    # Temporarily hidden from Executive KPIs. Re-enable this row and the render
+    # call below to show SLA breached, SLA met, and SLA compliance cards again.
+    # row2 = [
+    #     ("SLA breached",   resolved_scope, str(n_breached),  breach_secondary,                                       COLOR["red_fill"],       "breached", "btn_breached_popup", _show_breached_dialog, breached_df),
+    #     ("SLA met",        resolved_scope, str(n_met),       met_secondary,                                          COLOR["green_fill"],     "met",      "btn_met_popup",      _show_met_dialog,      met_df),
+    #     ("SLA compliance", resolved_scope, f"{compliance_pct:.0f}%", "Closed in period · target 95%",               comp_accent,             "compliance", None,               None,                  None),
+    # ]
 
     def _render_row(tiles: list) -> None:
         cols = st.columns(3)
@@ -1299,8 +1301,8 @@ def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
                         popup_func(popup_df, jira_domain)
 
     _render_row(row1)
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    _render_row(row2)
+    # st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    # _render_row(row2)
 
 
 def _render_priority_bars(open_df: pd.DataFrame) -> None:
