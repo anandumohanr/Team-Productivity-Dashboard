@@ -2,6 +2,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, date
 import altair as alt
 import pytz
@@ -9,6 +10,7 @@ import unicodedata
 import re
 import html as _html
 from requests.auth import HTTPBasicAuth
+from streamlit_autorefresh import st_autorefresh
 
 # =====================
 # Constants
@@ -28,12 +30,17 @@ REQUIRED_JIRA_SECRETS = [
     "JIRA_FILTER_ID",
 ]
 OPTIONAL_BUG_FILTER_SECRET = "JIRA_BUG_FILTER_ID"
+OPTIONAL_BOARD_SECRET = "JIRA_BOARD_ID"
 
 # Sprint structure — 2-week sprint has 10 calendar working days but only 7 dev days
 # (3 days are sprint ceremonies: planning, review, retro)
 SPRINT_WORKING_DAYS = 10
 SPRINT_DEV_DAYS = 7
 DEV_DAY_RATIO = SPRINT_DEV_DAYS / SPRINT_WORKING_DAYS   # 0.7
+
+# Sprint status grouping — case-insensitive comparison (Jira returns title-case)
+SPRINT_DONE_STATUSES = {"ACCEPTED IN QA", "CLOSED"}
+SPRINT_IN_PROGRESS_STATUSES = {"IN PROGRESS", "TEST", "DESIGN", "REVIEW", "IN REVIEW", "STAGING", "QA", "REOPENED"}
 
 # =====================
 # Data loading
@@ -113,7 +120,7 @@ def _jira_search_all(jira_domain: str, email: str, token: str, jql: str, fields:
             params["nextPageToken"] = page_token
             params["pageToken"] = page_token
 
-        resp = requests.get(url, headers=headers, auth=auth, params=params)
+        resp = requests.get(url, headers=headers, auth=auth, params=params, timeout=30)
         resp.raise_for_status()
         payload = resp.json()
 
@@ -237,6 +244,73 @@ def load_bug_data(jira_domain: str, email: str, token: str, bug_filter_id: str):
     except Exception as e:
         st.error(f"Failed to fetch bug data: {e}")
         return _empty_bug_df()
+
+
+# =====================
+# Sprint data loading
+# =====================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_sprint_list(jira_domain: str, email: str, token: str, board_id: str) -> list:
+    url = f"https://{jira_domain}/rest/agile/1.0/board/{board_id}/sprint"
+    auth = HTTPBasicAuth(email, token)
+    headers = {"Accept": "application/json"}
+    all_sprints, start_at = [], 0
+    while True:
+        params = {"state": "active,closed", "maxResults": 50, "startAt": start_at}
+        try:
+            resp = requests.get(url, headers=headers, auth=auth, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            break
+        values = data.get("values", [])
+        all_sprints.extend(values)
+        if data.get("isLast", True) or not values:
+            break
+        start_at += len(values)
+    all_sprints.sort(key=lambda s: s.get("startDate") or "", reverse=True)
+    return all_sprints
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_sprint_issues(jira_domain: str, email: str, token: str, sprint_id: int) -> pd.DataFrame:
+    jql = f"sprint = {sprint_id} ORDER BY status ASC"
+    fields = "key,summary,status,customfield_10010,customfield_11012"
+    empty = pd.DataFrame(columns=["Key", "Summary", "Status", "Status Group", "Story Points", "Developer", "Is Completed"])
+    try:
+        all_issues = _jira_search_all(jira_domain, email, token, jql, fields)
+        rows = []
+        for issue in all_issues:
+            f = issue.get("fields", {}) or {}
+            status_name = (f.get("status") or {}).get("name", "") or ""
+            status_upper = status_name.upper()
+            if status_upper in SPRINT_DONE_STATUSES:
+                status_group = "Done"
+            elif status_upper in SPRINT_IN_PROGRESS_STATUSES:
+                status_group = "In Progress"
+            else:
+                status_group = "Not Started"
+            dev_raw = f.get("customfield_11012")
+            developer = _normalize_str(_normalize_developer(dev_raw)) if dev_raw else ""
+            developer = developer or "(Unassigned)"
+            rows.append({
+                "Key": issue.get("key", ""),
+                "Summary": f.get("summary", "") or "",
+                "Status": status_name,
+                "Status Group": status_group,
+                "Story Points": f.get("customfield_10010"),
+                "Developer": developer,
+                "Is Completed": status_upper in SPRINT_DONE_STATUSES,
+            })
+        if not rows:
+            return empty
+        df = pd.DataFrame(rows)
+        df["Story Points"] = pd.to_numeric(df["Story Points"], errors="coerce").fillna(0)
+        return df
+    except Exception as e:
+        st.error(f"Failed to fetch sprint issues: {e}")
+        return empty
 
 
 # =====================
@@ -393,6 +467,56 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
     return team_metrics, dev_df
 
 
+def compute_sprint_metrics(df: pd.DataFrame):
+    """Returns (team_dict, dev_df) for a sprint issues DataFrame."""
+    empty_dev = pd.DataFrame(columns=["Developer", "Committed SP", "Delivered SP", "Completion %", "Total Issues", "Done Issues"])
+    if df.empty:
+        return {"committed_sp": 0, "delivered_sp": 0, "completion_pct": 0.0, "total_issues": 0,
+                "done_issues": 0, "carryover_issues": 0, "active_devs": 0,
+                "status_breakdown": {"Done": 0, "In Progress": 0, "Not Started": 0}}, empty_dev
+
+    committed_sp = df["Story Points"].sum()
+    delivered_sp = df[df["Is Completed"]]["Story Points"].sum()
+    carryover_sp = committed_sp - delivered_sp
+    completion_pct = round(float(delivered_sp) / float(committed_sp) * 100, 1) if committed_sp > 0 else 0.0
+    total_issues = len(df)
+    done_issues = int(df["Is Completed"].sum())
+    carryover_issues = total_issues - done_issues
+    devs = sorted(df["Developer"].dropna().unique())
+    active_devs = sum(1 for d in devs if d != "(Unassigned)")
+    status_breakdown = {
+        grp: round(float(df[df["Status Group"] == grp]["Story Points"].sum()), 1)
+        for grp in df["Status Group"].unique()
+    }
+    dev_rows = []
+    for dev in devs:
+        ddf = df[df["Developer"] == dev]
+        committed = float(ddf["Story Points"].sum())
+        delivered = float(ddf[ddf["Is Completed"]]["Story Points"].sum())
+        cp = round(delivered / committed * 100, 1) if committed > 0 else 0.0
+        dev_rows.append({
+            "Developer": dev,
+            "Committed SP": round(committed, 1),
+            "Delivered SP": round(delivered, 1),
+            "Completion %": cp,
+            "Total Issues": len(ddf),
+            "Done Issues": int(ddf["Is Completed"].sum()),
+        })
+    dev_df = pd.DataFrame(dev_rows).sort_values("Committed SP", ascending=False).reset_index(drop=True)
+    team = {
+        "committed_sp": round(float(committed_sp), 1),
+        "delivered_sp": round(float(delivered_sp), 1),
+        "carryover_sp": round(float(carryover_sp), 1),
+        "completion_pct": completion_pct,
+        "total_issues": total_issues,
+        "done_issues": done_issues,
+        "carryover_issues": carryover_issues,
+        "active_devs": active_devs,
+        "status_breakdown": status_breakdown,
+    }
+    return team, dev_df
+
+
 # =====================
 # Global CSS + UI helpers
 # =====================
@@ -415,6 +539,13 @@ header[data-testid="stHeader"],
 [data-testid="stStatusWidget"] { display: none !important; }
 /* Remove the top padding Streamlit adds to clear its header */
 .stMainBlockContainer { padding-top: 0 !important; }
+
+/* Hide the invisible iframe that streamlit-autorefresh injects */
+div[data-testid="stElementContainer"]:has(iframe[title*="autorefresh"]),
+div[data-testid="element-container"]:has(iframe[title*="autorefresh"]) {
+    display: none !important;
+}
+iframe[title*="autorefresh"] { display: none !important; }
 
 /* Headings */
 h1 { font-size: 22px !important; font-weight: 700 !important; color: #0f172a !important; }
@@ -479,6 +610,42 @@ hr { border-color: #e2e8f0 !important; margin: 1.5rem 0 !important; }
 ::-webkit-scrollbar-track { background: #f1f5f9; }
 ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* ── Inner Analytics sub-tabs (st.tabs) ─────────────────────────── */
+[data-testid="stTabsTabList"] {
+    gap: 0 !important;
+    border-bottom: 1px solid #e2e8f0 !important;
+    background: transparent !important;
+    padding: 0 !important;
+    margin-bottom: 4px !important;
+}
+button[data-testid="stTab"] {
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    color: #94a3b8 !important;
+    padding: 10px 18px !important;
+    border-radius: 0 !important;
+    background: transparent !important;
+    border-bottom: 2px solid transparent !important;
+}
+button[data-testid="stTab"]:hover {
+    color: #6366f1 !important;
+    background: #f8fafc !important;
+}
+button[data-testid="stTab"][aria-selected="true"] {
+    color: #6366f1 !important;
+    font-weight: 600 !important;
+    border-bottom: 2px solid #6366f1 !important;
+    background: transparent !important;
+}
+
+/* ── Selectbox polish ────────────────────────────────────────────── */
+[data-testid="stSelectbox"] > div > div {
+    box-shadow: 0 1px 3px rgba(0,0,0,.05) !important;
+}
+
+/* ── Generic card hover (applied where cards are used) ───────────── */
+.kpi-card:hover { box-shadow: 0 4px 16px rgba(99,102,241,.12) !important; }
 
 </style>
 """, unsafe_allow_html=True)
@@ -574,19 +741,22 @@ def render_kpi_cards(curr: dict, prev: dict):
 
         with col:
             st.markdown(f"""
-<div style="background:#ffffff;border-radius:12px;padding:20px 18px;
-            border:1px solid #e2e8f0;border-top:3px solid {accent};
-            position:relative;overflow:hidden;
-            box-shadow:0 1px 4px rgba(0,0,0,.06)">
-  <div style="position:absolute;top:14px;right:14px;min-width:32px;height:32px;
-              background:{accent}18;border-radius:8px;display:flex;
-              align-items:center;justify-content:center;
-              font-size:11px;font-weight:700;color:{accent};padding:0 6px">{icon}</div>
-  <div style="font-size:11px;color:#64748b;letter-spacing:.07em;
-              text-transform:uppercase;font-weight:600;margin-bottom:10px">{key}</div>
-  <div style="font-size:28px;font-weight:700;color:#0f172a;
-              line-height:1;margin-bottom:10px;letter-spacing:-.02em">{display_val}</div>
-  {bottom_html}
+<div style="background:#ffffff;border-radius:12px;padding:18px 16px;
+            border:1px solid #e2e8f0;
+            box-shadow:0 2px 8px rgba(0,0,0,.07);
+            display:flex;align-items:flex-start;gap:14px;
+            transition:box-shadow .2s ease">
+  <div style="width:44px;height:44px;background:{accent}18;border-radius:10px;
+              display:flex;align-items:center;justify-content:center;
+              font-size:13px;font-weight:800;color:{accent};
+              flex-shrink:0;letter-spacing:-.01em">{icon}</div>
+  <div style="flex:1;min-width:0">
+    <div style="font-size:11px;color:#64748b;letter-spacing:.07em;
+                text-transform:uppercase;font-weight:600;margin-bottom:4px">{key}</div>
+    <div style="font-size:26px;font-weight:700;color:#0f172a;
+                line-height:1;margin-bottom:8px;letter-spacing:-.02em">{display_val}</div>
+    {bottom_html}
+  </div>
 </div>""", unsafe_allow_html=True)
 
 
@@ -1040,12 +1210,316 @@ def render_raw_data(df: pd.DataFrame, bugs_df: pd.DataFrame, default_start: date
 
 
 # =====================
+# Sprint view
+# =====================
+
+def render_sprint_view(jira_config: dict):
+    board_id = _get_secret_value(OPTIONAL_BOARD_SECRET)
+
+    if not board_id:
+        st.markdown("""
+<div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;padding:28px;text-align:center;max-width:480px;margin:32px auto">
+  <div style="font-size:36px;margin-bottom:12px">🏃</div>
+  <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:8px">Sprint View not configured</div>
+  <div style="font-size:13px;color:#64748b;margin-bottom:16px">Add your Jira board ID to <code>~/.streamlit/secrets.toml</code> to enable this view.</div>
+  <code style="background:#f1f5f9;padding:6px 14px;border-radius:6px;font-size:13px;color:#4f46e5">JIRA_BOARD_ID = "473"</code>
+</div>
+""", unsafe_allow_html=True)
+        return
+
+    jira_domain = jira_config["JIRA_DOMAIN"]
+    email = jira_config["JIRA_EMAIL"]
+    token = jira_config["JIRA_API_TOKEN"]
+
+    DIVIDER = "<div style='height:1px;background:linear-gradient(90deg,#6366f1,transparent);margin:20px 0'></div>"
+    ist = pytz.timezone("Asia/Kolkata")
+    today = datetime.now(ist).date()
+
+    sprint_list = load_sprint_list(jira_domain, email, token, board_id)
+
+    if not sprint_list:
+        st.info("No sprints found for this board.")
+        return
+
+    def _sprint_label(s):
+        name = s.get("name", "Sprint")
+        state = s.get("state", "")
+        try:
+            end_dt = datetime.strptime(s["endDate"][:10], "%Y-%m-%d").date() if s.get("endDate") else None
+            start_dt = datetime.strptime(s["startDate"][:10], "%Y-%m-%d").date() if s.get("startDate") else None
+        except ValueError:
+            start_dt = end_dt = None
+        if state == "active":
+            days_left = (end_dt - today).days if end_dt else "?"
+            return f"▶ {name}  (Active · {days_left}d left)"
+        if start_dt and end_dt:
+            return f"{name}  ({start_dt.strftime('%d %b')} – {end_dt.strftime('%d %b %Y')})"
+        return name
+
+    labels = [_sprint_label(s) for s in sprint_list]
+    default_idx = next((i for i, s in enumerate(sprint_list) if s.get("state") == "active"), 0)
+
+    selected_label = st.selectbox(
+            "Sprint", labels, index=default_idx,
+            label_visibility="collapsed", key="sprint_selector",
+        )
+
+    selected_idx = labels.index(selected_label)
+    selected_sprint = sprint_list[selected_idx]
+    sprint_id = selected_sprint["id"]
+    sprint_name = selected_sprint["name"]
+    sprint_state = selected_sprint.get("state", "closed")
+    # Previous sprint is the next item in the list (list is sorted newest-first)
+    prev_sprint = sprint_list[selected_idx + 1] if selected_idx + 1 < len(sprint_list) else None
+
+    try:
+        start_dt = datetime.strptime(selected_sprint["startDate"][:10], "%Y-%m-%d").date() if selected_sprint.get("startDate") else None
+        end_dt = datetime.strptime(selected_sprint["endDate"][:10], "%Y-%m-%d").date() if selected_sprint.get("endDate") else None
+    except ValueError:
+        start_dt = end_dt = None
+
+    date_range_str = f"{start_dt.strftime('%d %b')} – {end_dt.strftime('%d %b %Y')}" if (start_dt and end_dt) else ""
+
+    if sprint_state == "active":
+        state_badge = '<span style="background:#dcfce7;color:#16a34a;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700">● ACTIVE</span>'
+        days_left = (end_dt - today).days if end_dt else None
+        if days_left is None:
+            days_info = ""
+        elif days_left < 0:
+            days_info = f'<span style="font-size:12px;color:#dc2626;font-weight:600;margin-left:8px">⚠ {abs(days_left)} day{"s" if abs(days_left) != 1 else ""} overdue</span>'
+        elif days_left == 0:
+            days_info = '<span style="font-size:12px;color:#f59e0b;font-weight:600;margin-left:8px">Last day</span>'
+        else:
+            days_info = f'<span style="font-size:13px;color:#64748b;margin-left:8px">{days_left} day{"s" if days_left != 1 else ""} remaining</span>'
+        progress_html = ""
+    else:
+        state_badge = '<span style="background:#f1f5f9;color:#475569;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700">✓ CLOSED</span>'
+        days_info = ""
+        progress_html = ""
+
+    st.markdown(f"""
+<div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:10px;padding:14px 20px;margin-bottom:16px">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <span style="font-size:15px;font-weight:700;color:#0f172a">{_html.escape(sprint_name)}</span>
+    <span style="font-size:13px;color:#64748b">{date_range_str}</span>
+    {state_badge}{days_info}
+  </div>
+  {progress_html}
+</div>
+""", unsafe_allow_html=True)
+
+    with st.spinner(f"Loading issues for {sprint_name}…"):
+        issues_df = load_sprint_issues(jira_domain, email, token, sprint_id)
+
+    if issues_df.empty:
+        st.info("No issues found for this sprint.")
+        return
+
+    # For a closed sprint, mid-sprint statuses (In Progress, Test, etc.) are
+    # misleading — those tickets were dropped to backlog unfinished. Collapse
+    # everything non-Done into a single "Not Delivered" bucket.
+    if sprint_state == "closed":
+        issues_df = issues_df.copy()
+        issues_df["Status Group"] = issues_df["Status Group"].apply(
+            lambda g: g if g == "Done" else "Not Delivered"
+        )
+
+    # Carry-forward detection: issues that also appeared in the previous sprint
+    carry_forward_keys = set()
+    prev_sprint_name = None
+    if prev_sprint:
+        prev_sprint_name = prev_sprint.get("name", "")
+        prev_df = load_sprint_issues(jira_domain, email, token, prev_sprint["id"])
+        if not prev_df.empty:
+            carry_forward_keys = set(prev_df["Key"]) & set(issues_df["Key"])
+    issues_df = issues_df.copy()
+    issues_df["Origin"] = issues_df["Key"].apply(
+        lambda k: "Carry-forward" if k in carry_forward_keys else "New"
+    )
+    fresh_sp = float(issues_df[issues_df["Origin"] == "New"]["Story Points"].sum())
+    cf_sp = float(issues_df[issues_df["Origin"] == "Carry-forward"]["Story Points"].sum())
+    cf_count = int((issues_df["Origin"] == "Carry-forward").sum())
+    fresh_count = int((issues_df["Origin"] == "New").sum())
+
+    team, dev_df = compute_sprint_metrics(issues_df)
+
+    # KPI cards
+    _section_header("Sprint Metrics", f"{team['total_issues']} issues · {team['active_devs']} developers")
+    kpi_cols = st.columns(5)
+    kpi_cfg = [
+        ("Committed SP",  f"{team['committed_sp']:.1f}", "Total SP in sprint",        "#6366f1", "SP"),
+        ("Delivered SP",  f"{team['delivered_sp']:.1f}", f"{team['done_issues']} issues done", "#22c55e", "✓"),
+        ("Completion %",  f"{team['completion_pct']:.1f}%", "Delivered / Committed",  "#06b6d4", "%"),
+        ("Pending SP",    f"{team['carryover_sp']:.1f}", f"{team['carryover_issues']} issues not done", "#f59e0b", "→"),
+        ("Active Devs",   str(team['active_devs']),      "Contributors",               "#8b5cf6", "DEV"),
+    ]
+    for col, (label, value, sublabel, accent, icon) in zip(kpi_cols, kpi_cfg):
+        with col:
+            st.markdown(f"""
+<div style="background:#ffffff;border-radius:12px;padding:18px 16px;
+            border:1px solid #e2e8f0;border-top:3px solid {accent};
+            position:relative;box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <div style="position:absolute;top:12px;right:12px;width:28px;height:28px;
+              background:{accent}18;border-radius:7px;display:flex;align-items:center;
+              justify-content:center;font-size:11px;font-weight:700;color:{accent}">{icon}</div>
+  <div style="font-size:10px;color:#64748b;letter-spacing:.07em;text-transform:uppercase;
+              font-weight:600;margin-bottom:8px">{label}</div>
+  <div style="font-size:26px;font-weight:700;color:#0f172a;line-height:1;
+              margin-bottom:8px;letter-spacing:-.02em">{value}</div>
+  <div style="font-size:11px;color:#94a3b8;font-weight:500">{sublabel}</div>
+</div>""", unsafe_allow_html=True)
+
+    # Sprint Composition (only shown when previous sprint data is available)
+    if prev_sprint and cf_count > 0:
+        prev_label = prev_sprint_name or "previous sprint"
+        _section_header("Sprint Composition", f"Fresh commitments vs carry-forward from {prev_label}")
+        comp_cols = st.columns(2)
+        comp_cfg = [
+            ("Fresh Commitment", f"{fresh_sp:.1f} SP", f"{fresh_count} new issues",                    "#6366f1"),
+            ("Carry-forward",    f"{cf_sp:.1f} SP",    f"{cf_count} issues from {prev_label}", "#f59e0b"),
+        ]
+        for col, (label, value, sublabel, accent) in zip(comp_cols, comp_cfg):
+            with col:
+                st.markdown(f"""
+<div style="background:#ffffff;border-radius:12px;padding:18px 16px;
+            border:1px solid #e2e8f0;border-left:4px solid {accent};
+            box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <div style="font-size:10px;color:#64748b;letter-spacing:.07em;text-transform:uppercase;
+              font-weight:600;margin-bottom:8px">{label}</div>
+  <div style="font-size:24px;font-weight:700;color:#0f172a;line-height:1;
+              margin-bottom:6px;letter-spacing:-.02em">{value}</div>
+  <div style="font-size:11px;color:#94a3b8;font-weight:500">{sublabel}</div>
+</div>""", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    st.markdown(DIVIDER, unsafe_allow_html=True)
+
+    # Developer breakdown table
+    _section_header("Developer Breakdown", "Planned vs Delivered per developer")
+    if not dev_df.empty:
+        th2 = "padding:10px 14px;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.07em;text-align:left;border-bottom:1px solid #e2e8f0"
+        td2 = "padding:12px 14px;font-size:13px;color:#334155;border-bottom:1px solid #f1f5f9;vertical-align:middle"
+        dev_rows = ""
+        for i, (_, r) in enumerate(dev_df.iterrows()):
+            bg = "#f8fafc" if i % 2 == 0 else "#ffffff"
+            cp = r["Completion %"]
+            bar_clr = "#16a34a" if cp >= 80 else ("#d97706" if cp >= 60 else "#dc2626")
+            bar_w = min(float(cp), 100)
+            progress = (
+                f'<div style="display:flex;align-items:center;gap:6px;min-width:130px">'
+                f'<div style="flex:1;background:#e2e8f0;border-radius:4px;height:5px">'
+                f'<div style="width:{bar_w:.0f}%;background:{bar_clr};height:5px;border-radius:4px"></div>'
+                f'</div>'
+                f'<span style="font-size:12px;font-weight:600;color:#0f172a;min-width:40px;text-align:right">{cp:.1f}%</span>'
+                f'</div>'
+            )
+            dev_rows += (
+                f'<tr style="background:{bg}">'
+                f'<td style="{td2};font-weight:600;color:#0f172a">{_html.escape(str(r["Developer"]))}</td>'
+                f'<td style="{td2};text-align:center;font-weight:700;font-size:15px;color:#6366f1">{r["Committed SP"]:.1f}</td>'
+                f'<td style="{td2};text-align:center;font-weight:700;font-size:15px;color:#22c55e">{r["Delivered SP"]:.1f}</td>'
+                f'<td style="{td2}">{progress}</td>'
+                f'<td style="{td2};text-align:center;color:#64748b">{int(r["Done Issues"])}/{int(r["Total Issues"])}</td>'
+                f'</tr>'
+            )
+        st.markdown(f"""
+<div style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;
+            overflow:hidden;overflow-x:auto;box-shadow:0 1px 4px rgba(0,0,0,.06);margin-bottom:20px">
+  <table style="width:100%;border-collapse:collapse">
+    <thead>
+      <tr style="background:#f8fafc">
+        <th style="{th2}">Developer</th>
+        <th style="{th2};text-align:center">Committed SP</th>
+        <th style="{th2};text-align:center">Delivered SP</th>
+        <th style="{th2}">Completion</th>
+        <th style="{th2};text-align:center">Issues Done</th>
+      </tr>
+    </thead>
+    <tbody>{dev_rows}</tbody>
+  </table>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(DIVIDER, unsafe_allow_html=True)
+
+    # Sprint issues table — collapsible
+    with st.expander(f"Sprint Issues  ({len(issues_df)} total)", expanded=False):
+        all_sprint_devs = sorted(issues_df["Developer"].dropna().unique())
+        sel_sprint_devs = st.multiselect("Filter by developer", all_sprint_devs, key="sprint_dev_filter")
+        display_df = issues_df.copy()
+        if sel_sprint_devs:
+            display_df = display_df[display_df["Developer"].isin(sel_sprint_devs)]
+
+        jira_base = f"https://{jira_domain}/browse/"
+        th3 = "padding:8px 12px;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.07em;text-align:left;border-bottom:1px solid #e2e8f0;white-space:nowrap"
+        td3 = "padding:10px 12px;font-size:13px;color:#334155;border-bottom:1px solid #f1f5f9;vertical-align:middle"
+
+        def _group_bg(g):
+            return {"Done": "#f0fdf4", "In Progress": "#fffbeb", "Not Delivered": "#fff1f2"}.get(g, "#ffffff")
+
+        def _group_badge(g):
+            if g == "Done":
+                return '<span style="background:#dcfce7;color:#16a34a;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">Done</span>'
+            if g == "In Progress":
+                return '<span style="background:#fef3c7;color:#d97706;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">In Progress</span>'
+            if g == "Not Delivered":
+                return '<span style="background:#fee2e2;color:#dc2626;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">Not Delivered</span>'
+            return '<span style="background:#f1f5f9;color:#64748b;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">Not Started</span>'
+
+        def _origin_badge(o):
+            if o == "Carry-forward":
+                return '<span style="background:#fff7ed;color:#c2410c;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">↩ Carry-forward</span>'
+            return '<span style="background:#eff6ff;color:#1d4ed8;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">New</span>'
+
+        show_origin = prev_sprint is not None
+        issue_rows = ""
+        for _, r in display_df.iterrows():
+            bg = _group_bg(r["Status Group"])
+            sp_str = f"{r['Story Points']:.1f}" if r["Story Points"] > 0 else "—"
+            link = f'<a href="{jira_base}{r["Key"]}" target="_blank" style="color:#6366f1;font-weight:600;text-decoration:none">{_html.escape(r["Key"])}</a>'
+            summ = _html.escape(str(r["Summary"])[:90]) + ("…" if len(str(r["Summary"])) > 90 else "")
+            origin_cell = f'<td style="{td3}">{_origin_badge(r["Origin"])}</td>' if show_origin else ""
+            issue_rows += (
+                f'<tr style="background:{bg}">'
+                f'<td style="{td3};white-space:nowrap">{link}</td>'
+                f'<td style="{td3};max-width:340px">{summ}</td>'
+                f'<td style="{td3};white-space:nowrap">{_html.escape(r["Developer"])}</td>'
+                f'<td style="{td3};text-align:center;font-weight:600;color:#4f46e5">{sp_str}</td>'
+                f'<td style="{td3};white-space:nowrap">{_html.escape(r["Status"])}</td>'
+                f'<td style="{td3}">{_group_badge(r["Status Group"])}</td>'
+                f'{origin_cell}'
+                f'</tr>'
+            )
+
+        origin_header = f'<th style="{th3}">Origin</th>' if show_origin else ""
+        st.markdown(f"""
+<div style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;
+            overflow:hidden;overflow-x:auto;box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <table style="width:100%;border-collapse:collapse">
+    <thead>
+      <tr style="background:#f8fafc">
+        <th style="{th3}">Key</th>
+        <th style="{th3}">Summary</th>
+        <th style="{th3}">Developer</th>
+        <th style="{th3};text-align:center">SP</th>
+        <th style="{th3}">Status</th>
+        <th style="{th3}">Group</th>
+        {origin_header}
+      </tr>
+    </thead>
+    <tbody>{issue_rows}</tbody>
+  </table>
+</div>
+""", unsafe_allow_html=True)
+
+
+# =====================
 # Main
 # =====================
 
 def main():
     st.set_page_config(
-        page_title="Team Productivity Dashboard",
+        page_title="MedLern Product Team Metrics",
         page_icon="📊",
         layout="wide",
     )
@@ -1055,28 +1529,160 @@ def main():
     ist = pytz.timezone("Asia/Kolkata")
     today = datetime.now(ist).date()
 
+    # Global auto-refresh — fires every 30 min; cache TTLs handle actual re-fetch
+    st_autorefresh(interval=30 * 60 * 1000, key="global_autorefresh")
+
     # ── Header ──────────────────────────────────────────────────────────
-    st.markdown("""
-<div style="display:flex;align-items:center;gap:14px;padding:8px 0 4px">
-  <div style="width:42px;height:42px;background:linear-gradient(135deg,#6366f1,#8b5cf6);
-              border-radius:10px;display:flex;align-items:center;justify-content:center;
-              font-size:20px;flex-shrink:0;">📊</div>
+    _last_refreshed = st.session_state.get("_last_refreshed")
+    _refresh_label = (
+        _last_refreshed.strftime("%d %b · %H:%M IST")
+        if _last_refreshed else "—"
+    )
+    _hdr_left, _hdr_btn = st.columns([6, 1])
+    with _hdr_left:
+        st.markdown("""
+<div style="display:flex;align-items:center;gap:14px;padding:16px 0 14px">
+  <div style="width:38px;height:38px;background:linear-gradient(135deg,#6366f1,#8b5cf6);
+              border-radius:9px;display:flex;align-items:center;justify-content:center;
+              font-size:18px;flex-shrink:0;box-shadow:0 2px 8px rgba(99,102,241,.3)">📊</div>
   <div>
-    <div style="font-size:22px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;
-                line-height:1.2">Team Productivity Dashboard</div>
-    <div style="font-size:12px;color:#64748b;margin-top:2px">
-      Engineering team metrics &amp; quality tracking
+    <div style="font-size:20px;font-weight:700;color:#0f172a;letter-spacing:-0.4px;
+                line-height:1.2">MedLern Product Team Metrics</div>
+    <div style="font-size:11px;color:#94a3b8;margin-top:2px;font-weight:500;
+                letter-spacing:0.04em;text-transform:uppercase">
+      Engineering metrics &amp; quality tracking
     </div>
   </div>
 </div>
 """, unsafe_allow_html=True)
+    with _hdr_btn:
+        st.markdown("""
+<style>
+.st-key-_global_refresh { margin-top: 16px !important; }
+.st-key-_global_refresh button {
+    white-space: nowrap !important;
+    font-size: 12px !important;
+    padding: 6px 14px !important;
+    line-height: 1.4 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+        if st.button(
+            f"↻ Refresh all  ·  {_refresh_label}",
+            key="_global_refresh",
+            use_container_width=True,
+        ):
+            st.cache_data.clear()
+            st.session_state.pop("_data_prewarmed", None)
+            st.session_state.pop("_last_refreshed", None)
+            st.rerun()
+    st.markdown(
+        "<div style='height:1px;background:#e2e8f0;margin:0 0 4px'></div>",
+        unsafe_allow_html=True,
+    )
 
     missing_keys, jira_config = validate_jira_config()
     if missing_keys:
         render_missing_config(missing_keys)
         st.stop()
 
-    # ── Controls ────────────────────────────────────────────────────────
+    # ── Parallel data pre-warm ───────────────────────────────────────────
+    # All three mode data sources are loaded concurrently so that switching
+    # between modes is instant (subsequent calls are @st.cache_data hits).
+    _board_id = _get_secret_value(OPTIONAL_BOARD_SECRET)
+
+    def _prewarm_analytics():
+        load_jira_data(jira_config["JIRA_DOMAIN"], jira_config["JIRA_EMAIL"],
+                       jira_config["JIRA_API_TOKEN"], jira_config["JIRA_FILTER_ID"])
+        load_bug_data(jira_config["JIRA_DOMAIN"], jira_config["JIRA_EMAIL"],
+                      jira_config["JIRA_API_TOKEN"], jira_config[OPTIONAL_BUG_FILTER_SECRET])
+
+    def _prewarm_defect():
+        from defect_sla_dashboard import load_defect_data as _ldd
+        _ldd()
+
+    def _prewarm_sprint():
+        if _board_id:
+            load_sprint_list(jira_config["JIRA_DOMAIN"], jira_config["JIRA_EMAIL"],
+                             jira_config["JIRA_API_TOKEN"], _board_id)
+
+    if not st.session_state.get("_data_prewarmed"):
+        with st.spinner("Loading dashboard data…"):
+            with ThreadPoolExecutor(max_workers=3) as _pool:
+                _futures = {
+                    _pool.submit(_prewarm_analytics): "Team Overview",
+                    _pool.submit(_prewarm_defect): "Client Issues",
+                    _pool.submit(_prewarm_sprint): "Sprint Tracker",
+                }
+                for _fut in as_completed(_futures):
+                    try:
+                        _fut.result()
+                    except Exception as _e:
+                        st.warning(f"{_futures[_fut]} data load warning: {_e}")
+        st.session_state["_data_prewarmed"] = True
+        st.session_state["_last_refreshed"] = datetime.now(ist)
+        st.rerun()  # re-render header so the timestamp appears immediately
+
+    # ── Mode toggle ─────────────────────────────────────────────────────
+    VIEW_MODES = ["📊 Team Overview", "🏃 Sprint Tracker", "🚨 Client Issues"]
+    if "view_mode" not in st.session_state:
+        st.session_state["view_mode"] = "📊 Team Overview"
+
+    _active_idx = VIEW_MODES.index(st.session_state["view_mode"])
+    st.markdown(f"""
+<style>
+/* Underline tab nav — scoped to these three button keys */
+.st-key-_nav_0 button, .st-key-_nav_1 button, .st-key-_nav_2 button {{
+    background: transparent !important;
+    border: none !important;
+    border-bottom: 3px solid transparent !important;
+    border-radius: 0 !important;
+    color: #94a3b8 !important;
+    font-size: 14px !important;
+    font-weight: 500 !important;
+    padding: 10px 8px 11px !important;
+    box-shadow: none !important;
+    width: 100% !important;
+    letter-spacing: 0.01em !important;
+    transition: color 0.15s ease, border-color 0.15s ease !important;
+}}
+.st-key-_nav_0 button:hover, .st-key-_nav_1 button:hover, .st-key-_nav_2 button:hover {{
+    background: transparent !important;
+    color: #6366f1 !important;
+    border-bottom: 3px solid #c7d2fe !important;
+    box-shadow: none !important;
+}}
+.st-key-_nav_{_active_idx} button {{
+    color: #6366f1 !important;
+    border-bottom: 3px solid #6366f1 !important;
+    font-weight: 600 !important;
+}}
+</style>
+""", unsafe_allow_html=True)
+
+    _nav_cols = st.columns(3)
+    for _i, (_col, _mode) in enumerate(zip(_nav_cols, VIEW_MODES)):
+        with _col:
+            if st.button(_mode, key=f"_nav_{_i}", use_container_width=True):
+                st.session_state["view_mode"] = _mode
+                st.rerun()
+
+    view_mode = st.session_state["view_mode"]
+    st.markdown(
+        "<div style='height:1px;background:#e2e8f0;margin:-4px 0 20px'></div>",
+        unsafe_allow_html=True,
+    )
+
+    if view_mode == "🏃 Sprint Tracker":
+        render_sprint_view(jira_config)
+        return
+
+    if view_mode == "🚨 Client Issues":
+        from defect_sla_dashboard import render_defect_sla
+        render_defect_sla(inject_base_css=False)
+        return
+
+    # ── Analytics mode ──────────────────────────────────────────────────
     with st.container():
         period_types = [
             "Current Week", "Current Month", "Current Quarter", "Current Year",
@@ -1090,8 +1696,15 @@ def main():
 
         period_labels = [_period_label(pt) for pt in period_types]
 
-        ctrl_col, btn_col, time_col = st.columns([3, 1, 2])
-        with ctrl_col:
+        st.markdown(
+            "<div style='margin-top:12px'>"
+            "<p style='font-size:11px;font-weight:600;color:#64748b;"
+            "letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px'>"
+            "Period</p></div>",
+            unsafe_allow_html=True,
+        )
+        _period_col, _ = st.columns([2, 3])
+        with _period_col:
             selected_label = st.selectbox(
                 "Period",
                 period_labels,
@@ -1099,37 +1712,6 @@ def main():
                 label_visibility="collapsed",
             )
             period_type = period_types[period_labels.index(selected_label)]
-        with btn_col:
-            if st.button("🔄 Refresh"):
-                st.cache_data.clear()
-                st.rerun()
-        with time_col:
-            now_str = datetime.now(ist).strftime("%d %b %Y · %H:%M %Z")
-            st.markdown(
-                f'<div style="display:flex;justify-content:flex-end;align-items:center;height:100%">'
-                f'<span style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:20px;'
-                f'padding:4px 12px;font-size:12px;color:#64748b;font-weight:500;white-space:nowrap">'
-                f'🕐 {now_str}</span></div>',
-                unsafe_allow_html=True,
-            )
-
-        bug_config_note = (
-            "Bug metrics use Jira Created date from JIRA_BUG_FILTER_ID."
-            if jira_config[OPTIONAL_BUG_FILTER_SECRET]
-            else "Optional JIRA_BUG_FILTER_ID is not configured, so bug and quality metrics are shown without bug-filter data."
-        )
-        st.markdown(
-            f"""
-<div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin-top:8px">
-  <span style="font-size:12px;color:#475569;font-weight:600">Period semantics:</span>
-  <span style="font-size:12px;color:#64748b">
-    Task metrics use Jira Due Date. {bug_config_note}
-    Current periods are capped at {today.strftime('%d %b %Y')}. Capacity uses 7 dev days per 10 working days.
-  </span>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
 
         if period_type == "Custom":
             c1, c2, _ = st.columns([2, 2, 2])
@@ -1152,19 +1734,19 @@ def main():
     st.markdown("<div style='height:1px;background:linear-gradient(90deg,#6366f1,transparent);margin:12px 0 20px'></div>", unsafe_allow_html=True)
 
     # ── Load data ───────────────────────────────────────────────────────
-    with st.spinner("Loading data from Jira…"):
-        df = load_jira_data(
-            jira_config["JIRA_DOMAIN"],
-            jira_config["JIRA_EMAIL"],
-            jira_config["JIRA_API_TOKEN"],
-            jira_config["JIRA_FILTER_ID"],
-        )
-        bugs_df = load_bug_data(
-            jira_config["JIRA_DOMAIN"],
-            jira_config["JIRA_EMAIL"],
-            jira_config["JIRA_API_TOKEN"],
-            jira_config[OPTIONAL_BUG_FILTER_SECRET],
-        )
+    # Data is guaranteed cached from the prewarm step — no spinner needed.
+    df = load_jira_data(
+        jira_config["JIRA_DOMAIN"],
+        jira_config["JIRA_EMAIL"],
+        jira_config["JIRA_API_TOKEN"],
+        jira_config["JIRA_FILTER_ID"],
+    )
+    bugs_df = load_bug_data(
+        jira_config["JIRA_DOMAIN"],
+        jira_config["JIRA_EMAIL"],
+        jira_config["JIRA_API_TOKEN"],
+        jira_config[OPTIONAL_BUG_FILTER_SECRET],
+    )
 
     if df.empty:
         st.warning("No task data loaded. Check your Jira credentials and filter ID.")

@@ -539,6 +539,7 @@ def extract_client(description_text: str, summary: str) -> tuple[str, str]:
 # Derived dataframe builder
 # =====================
 
+@st.cache_data(ttl=300, show_spinner=False)
 def build_derived(df: pd.DataFrame, now: datetime) -> pd.DataFrame:
     """Add sla_*, client, age_days, extraction_source columns to the raw df."""
     if df.empty:
@@ -581,7 +582,7 @@ def build_derived(df: pd.DataFrame, now: datetime) -> pd.DataFrame:
         end = resolved if (is_closed and pd.notna(resolved)) else now
         created_dt = created.to_pydatetime() if hasattr(created, "to_pydatetime") else created
         end_dt = end.to_pydatetime() if hasattr(end, "to_pydatetime") else end
-        return max(0.0, (end_dt - created_dt).total_seconds() / 86400)
+        return working_days(created_dt, end_dt)
 
     out["age_days"] = out.apply(_age, axis=1)
     return out
@@ -590,6 +591,74 @@ def build_derived(df: pd.DataFrame, now: datetime) -> pd.DataFrame:
 # =====================
 # CSS + section header (adapted from dashboard.py)
 # =====================
+
+def _inject_sla_css_additions() -> None:
+    """SLA-specific CSS additions. Called when embedded in the unified dashboard
+    so we avoid overriding the shared base styles (button colors, fonts, etc.)."""
+    st.markdown(f"""
+<style>
+/* Hide the invisible iframe that streamlit-autorefresh injects */
+div[data-testid="stElementContainer"]:has(iframe[title*="autorefresh"]),
+div[data-testid="element-container"]:has(iframe[title*="autorefresh"]) {{
+    display: none !important;
+}}
+iframe[title*="autorefresh"] {{ display: none !important; }}
+
+/* Fresh-chip uses a distinctive teal */
+.st-key-chip_fresh .stButton > button {{
+    background: #0e7490 !important; color: #fff !important;
+    border: 1px solid #0e7490 !important;
+}}
+.st-key-chip_fresh .stButton > button:hover {{ background: #155e75 !important; }}
+.st-key-chip_fresh .stButton > button[kind="primary"] {{
+    background: #0891b2 !important; border-color: #0891b2 !important;
+    box-shadow: 0 0 0 2px rgba(8,145,178,.25) !important;
+}}
+
+/* SLA-met chip — green */
+.st-key-chip_met .stButton > button {{
+    background: #15803d !important; color: #fff !important;
+    border: 1px solid #15803d !important;
+}}
+.st-key-chip_met .stButton > button:hover {{ background: #166534 !important; }}
+.st-key-chip_met .stButton > button[kind="primary"] {{
+    background: #16a34a !important; border-color: #16a34a !important;
+    box-shadow: 0 0 0 2px rgba(22,163,74,.25) !important;
+}}
+
+/* Clickable KPI cards — transparent overlay buttons */
+div:has(> :is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+              .st-key-btn_closed_popup,
+              .st-key-btn_breached_popup, .st-key-btn_met_popup)) {{
+    position: relative !important;
+}}
+:is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+    .st-key-btn_closed_popup,
+    .st-key-btn_breached_popup, .st-key-btn_met_popup) {{
+    position: absolute !important; top: 0 !important; left: 0 !important;
+    right: 0 !important; bottom: 0 !important; z-index: 10 !important;
+    margin: 0 !important; padding: 0 !important; pointer-events: none !important;
+}}
+:is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+    .st-key-btn_closed_popup,
+    .st-key-btn_breached_popup, .st-key-btn_met_popup) > div {{ height: 100% !important; margin: 0 !important; }}
+:is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+    .st-key-btn_closed_popup,
+    .st-key-btn_breached_popup, .st-key-btn_met_popup) > div > button {{
+    height: 100% !important; width: 100% !important;
+    background: transparent !important; border: none !important;
+    box-shadow: none !important; outline: none !important;
+    padding: 0 !important; cursor: pointer !important;
+    border-radius: 12px !important; pointer-events: auto !important;
+}}
+:is(.st-key-btn_open_popup, .st-key-btn_reported_popup,
+    .st-key-btn_closed_popup,
+    .st-key-btn_breached_popup, .st-key-btn_met_popup) > div > button:hover {{
+    background: transparent !important;
+}}
+</style>
+""", unsafe_allow_html=True)
+
 
 def _inject_css() -> None:
     st.markdown(f"""
@@ -687,6 +756,10 @@ hr {{ border-color: {COLOR["border"]} !important; margin: 1.5rem 0 !important; }
 ::-webkit-scrollbar-track {{ background: #f1f5f9; }}
 ::-webkit-scrollbar-thumb {{ background: #cbd5e1; border-radius: 3px; }}
 ::-webkit-scrollbar-thumb:hover {{ background: #94a3b8; }}
+
+[data-testid="stSelectbox"] > div > div {{
+    box-shadow: 0 1px 3px rgba(0,0,0,.05) !important;
+}}
 
 /* Clickable KPI cards — transparent overlay button, position:absolute so it
    takes zero space in normal flow and matches the card's exact dimensions. */
@@ -787,19 +860,22 @@ def _get_period_bounds(period_type: str, today: date) -> tuple[date, date]:
 def _render_header_bar(jira_domain: str, total_open: int, fetched_at: datetime,
                        today: date) -> tuple[date, date]:
     """Top header bar. Returns (start_date, end_date)."""
-    render_str = datetime.now(IST).strftime("%d %b %Y · %H:%M %Z")
     sync_str = fetched_at.strftime("%d %b %Y · %H:%M %Z")
 
     st.markdown(f"""
-<div style="display:flex;align-items:center;gap:14px;padding:8px 0 4px">
-  <div style="width:42px;height:42px;background:linear-gradient(135deg,{COLOR["red_fill"]},{COLOR["amber_fill"]});
-              border-radius:10px;display:flex;align-items:center;justify-content:center;
-              font-size:20px;flex-shrink:0;color:#fff;font-weight:700">!</div>
+<div style="display:flex;align-items:center;gap:12px;padding:6px 0 14px;
+            border-bottom:1px solid {COLOR["border"]};margin-bottom:4px">
+  <div style="width:36px;height:36px;
+              background:linear-gradient(135deg,{COLOR["red_fill"]},{COLOR["amber_fill"]});
+              border-radius:9px;display:flex;align-items:center;justify-content:center;
+              font-size:16px;flex-shrink:0;color:#fff;font-weight:700;
+              box-shadow:0 2px 6px rgba(163,45,45,.3)">!</div>
   <div style="flex:1">
-    <div style="font-size:22px;font-weight:700;color:{COLOR["text_primary"]};
-                letter-spacing:-0.3px;line-height:1.2">Client defect SLA tracker</div>
-    <div style="font-size:12px;color:{COLOR["text_secondary"]};margin-top:2px">
-      MDLRN · {total_open} open client-reported defects · Data sync {sync_str}
+    <div style="font-size:18px;font-weight:700;color:{COLOR["text_primary"]};
+                letter-spacing:-0.3px;line-height:1.2">Client Issues Tracker</div>
+    <div style="font-size:11px;color:{COLOR["text_tertiary"]};margin-top:2px;
+                font-weight:500;letter-spacing:0.04em;text-transform:uppercase">
+      MDLRN · {total_open} open defects · synced {sync_str}
     </div>
   </div>
 </div>
@@ -813,27 +889,21 @@ def _render_header_bar(jira_domain: str, total_open: int, fetched_at: datetime,
 
     period_labels = [_period_label(pt) for pt in PERIOD_TYPES]
 
-    c1, c2, c3 = st.columns([3, 1, 2])
-    with c1:
+    st.markdown(
+        f"<div style='margin-top:12px'>"
+        f"<p style='font-size:11px;font-weight:600;color:{COLOR['text_secondary']};"
+        f"letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px'>"
+        f"Period</p></div>",
+        unsafe_allow_html=True,
+    )
+    _period_col, _ = st.columns([2, 3])
+    with _period_col:
         selected_label = st.selectbox(
             "Period", period_labels,
             index=0,  # Current Month default
             label_visibility="collapsed", key="period_choice",
         )
         period_type = PERIOD_TYPES[period_labels.index(selected_label)]
-    with c2:
-        if st.button("↻ Refresh", key="refresh_btn"):
-            st.cache_data.clear()
-            st.rerun()
-    with c3:
-        st.markdown(
-            f'<div style="display:flex;justify-content:flex-end;align-items:center;height:100%">'
-            f'<span style="background:#f1f5f9;border:1px solid {COLOR["border"]};'
-            f'border-radius:20px;padding:4px 12px;font-size:12px;'
-            f'color:{COLOR["text_secondary"]};font-weight:500;white-space:nowrap">'
-            f'🕐 Rendered {render_str}</span></div>',
-            unsafe_allow_html=True,
-        )
 
     # Custom date pickers (only when Custom is selected)
     if period_type == "Custom":
@@ -852,6 +922,7 @@ def _render_header_bar(jira_domain: str, total_open: int, fetched_at: datetime,
     return start_date, end_date
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def _kpi_snapshot_at(all_df: pd.DataFrame, period_start: date, period_end: date,
                      as_of: datetime) -> dict:
     """Reconstruct KPI counts as of `as_of`.
@@ -906,8 +977,11 @@ def _kpi_snapshot_at(all_df: pd.DataFrame, period_start: date, period_end: date,
     if n_closed > 0:
         n_met = int((closed_period["sla_label"] == "met").sum())
         n_breached = int((closed_period["sla_label"] == "breached").sum())
-        hours = (closed_period["resolved"] - closed_period["created"]).dt.total_seconds() / 3600
-        avg_res: float | None = float(hours.mean() / 24)
+        avg_res: float | None = float(
+            closed_period.apply(
+                lambda r: working_days(r["created"].to_pydatetime(), r["resolved"].to_pydatetime()), axis=1
+            ).mean()
+        )
         period_tracked = closed_period[
             closed_period["sla_label"].isin(["on_track", "at_risk", "breached", "met"])
         ]
@@ -1002,12 +1076,14 @@ def _render_health_banner(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
 
     # Extra metrics
     oldest_age = float(open_df["age_days"].max()) if not open_df.empty else 0.0
-    oldest_str = f"{oldest_age * 24:.0f}h" if oldest_age < 1 else f"{oldest_age:.0f}d"
+    oldest_str = f"{oldest_age * 8:.0f}h" if oldest_age < 1 else f"{oldest_age:.0f}d"
 
     avg_res_str = "—"
     if not closed_recent_df.empty:
-        hours = (closed_recent_df["resolved"] - closed_recent_df["created"]).dt.total_seconds() / 3600
-        avg_res_str = f"{float(hours.mean()) / 24:.1f}d"
+        wd_series = closed_recent_df.apply(
+            lambda r: working_days(r["created"].to_pydatetime(), r["resolved"].to_pydatetime()), axis=1
+        )
+        avg_res_str = f"{float(wd_series.mean()):.1f}d"
 
     tagged = open_df[open_df["client"] != "CLIENT NOT TAGGED"]
     n_clients = int(tagged["client"].nunique()) if not tagged.empty else 0
@@ -1119,8 +1195,10 @@ def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
     n_reported = len(reported_df)
 
     if not closed_recent_df.empty:
-        hours = (closed_recent_df["resolved"] - closed_recent_df["created"]).dt.total_seconds() / 3600
-        avg_days_num: float | None = float(hours.mean() / 24)
+        wd_series = closed_recent_df.apply(
+            lambda r: working_days(r["created"].to_pydatetime(), r["resolved"].to_pydatetime()), axis=1
+        )
+        avg_days_num: float | None = float(wd_series.mean())
         avg_resolution = f"{avg_days_num:.1f}d"
         n_closed = len(closed_recent_df)
         n_met = int((closed_recent_df["sla_label"] == "met").sum())
@@ -1158,7 +1236,7 @@ def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
     deltas = {
         "open":       (n_open     - prev_snap.get("open", 0),              "",  True),
         "reported":   (n_reported - prev_snap.get("reported", 0),          "",  True),
-        "closed":     (n_closed   - prev_snap.get("closed", 0),            "",  False),
+        "closed":     (n_closed   - prev_snap.get("n_closed", 0),           "",  False),
         "compliance": (compliance_pct - prev_snap.get("compliance_pct", 100.0), "%", False),
         "breached":   (n_breached - prev_snap.get("breached", 0),          "",  True),
         "met":        (n_met      - prev_snap.get("met", 0),               "",  False),
@@ -1203,17 +1281,17 @@ def _render_kpi_cards(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
             )
             with col:
                 st.markdown(f"""
-<div style="background:{COLOR["card_bg"]};border-radius:12px;padding:14px 16px;
+<div style="background:{COLOR["card_bg"]};border-radius:12px;padding:16px 16px;
             border:1px solid {COLOR["border"]};border-top:3px solid {accent};
-            box-shadow:0 1px 4px rgba(0,0,0,.06)">
+            box-shadow:0 2px 8px rgba(0,0,0,.07)">
   <div style="font-size:11px;color:{COLOR["text_secondary"]};letter-spacing:.07em;
               text-transform:uppercase;font-weight:600;margin-bottom:2px">{label}</div>
-  <div style="font-size:9px;color:{COLOR["text_tertiary"]};letter-spacing:.05em;
-              font-weight:500;margin-bottom:6px">{scope}</div>
+  <div style="font-size:10px;color:{COLOR["text_tertiary"]};letter-spacing:.04em;
+              font-weight:500;margin-bottom:7px">{scope}</div>
   <div style="font-size:26px;font-weight:700;color:{COLOR["text_primary"]};
-              line-height:1;margin-bottom:6px;letter-spacing:-.02em">{value}</div>
+              line-height:1;margin-bottom:7px;letter-spacing:-.02em">{value}</div>
   {delta_html}
-  <div style="font-size:11px;color:{COLOR["text_secondary"]};font-weight:500">{secondary}</div>
+  <div style="font-size:11px;color:{COLOR["text_secondary"]};font-weight:500;margin-top:4px">{secondary}</div>
 </div>
 """, unsafe_allow_html=True)
                 if btn_key:
@@ -1364,13 +1442,10 @@ def _render_median_resolution(closed_recent_df: pd.DataFrame) -> None:
             if subset.empty:
                 parts.append(f"<b>{pri}</b> median: —")
                 continue
-            kind, _ = SLA_CONFIG[pri]
-            deltas_h = (subset["resolved"] - subset["created"]).dt.total_seconds() / 3600
-            med_h = float(deltas_h.median())
-            if kind == "calendar_hours":
-                parts.append(f"<b>{pri}</b> median: {med_h:.1f}h")
-            else:
-                parts.append(f"<b>{pri}</b> median: {med_h / 24:.1f}d")
+            wd_vals = subset.apply(
+                lambda r: working_days(r["created"].to_pydatetime(), r["resolved"].to_pydatetime()), axis=1
+            )
+            parts.append(f"<b>{pri}</b> median: {float(wd_vals.median()):.1f}d")
         medians_html = " · ".join(parts)
 
     st.markdown(f"""
@@ -1502,7 +1577,7 @@ def _render_ticket_table(open_df: pd.DataFrame, jira_domain: str,
 
         age_days = r["age_days"]
         if age_days < 1:
-            age_str = f"{age_days * 24:.0f}h"
+            age_str = f"{age_days * 8:.0f}h"
         else:
             age_str = f"{age_days:.0f}d"
 
@@ -2142,7 +2217,7 @@ def _render_share_section(open_df: pd.DataFrame, closed_recent_df: pd.DataFrame,
 
     report_html = (
         f'<div style="font-family:Calibri,Arial,sans-serif;color:#111111;font-weight:normal">'
-        f'<p style="font-size:18px;font-weight:bold;margin-bottom:2px;color:#111111">Client Defect SLA Report</p>'
+        f'<p style="font-size:18px;font-weight:bold;margin-bottom:2px;color:#111111">Client Issues Report</p>'
         f'<p style="font-size:13px;color:#555555;font-weight:normal;margin-top:0;margin-bottom:14px">'
         f'MDLRN · {datetime.now(IST).strftime("%d %b %Y")}</p>'
 
@@ -2206,27 +2281,29 @@ function copyReport(btn) {{
 # main()
 # =====================
 
-def main() -> None:
-    st.set_page_config(
-        page_title="Client Defect SLA Tracker",
-        page_icon="🚨",
-        layout="wide",
-    )
-    _inject_css()
+def render_defect_sla(inject_base_css: bool = True) -> None:
+    """Render defect SLA content.
+
+    Called by the unified dashboard.py (inject_base_css=False — base styles
+    already injected) or standalone via main() (inject_base_css=True).
+    """
+    if inject_base_css:
+        _inject_css()
+        # Standalone mode: own auto-refresh. Embedded: dashboard.py handles it.
+        st_autorefresh(interval=30 * 60 * 1000, key="defect_sla_autorefresh")
+    else:
+        _inject_sla_css_additions()
 
     missing_keys, jira_config = validate_jira_config()
     if missing_keys:
         render_missing_config(missing_keys)
         st.stop()
 
-    # Auto-refresh every 30 minutes. Cache TTL is 15 min, so each rerun refetches.
-    st_autorefresh(interval=30 * 60 * 1000, key="defect_sla_autorefresh")
-
     now = datetime.now(IST)
+    _now_min = now.replace(second=0, microsecond=0)
     jira_domain = jira_config["JIRA_DOMAIN"]
 
-    with st.spinner("Loading defects from Jira…"):
-        raw_df, fetched_at = load_defect_data()
+    raw_df, fetched_at = load_defect_data()
 
     if raw_df.empty:
         st.warning(
@@ -2235,7 +2312,7 @@ def main() -> None:
         )
         st.stop()
 
-    derived_df = build_derived(raw_df, now)
+    derived_df = build_derived(raw_df, _now_min)
 
     # Partition by status
     is_closed = derived_df["status"].str.lower() == "closed"
@@ -2280,7 +2357,7 @@ def main() -> None:
         f"Open defects is a live all-open snapshot. Reported uses created date; SLA breached/met and resolution use resolved date for {period_label}.",
     )
     prev_snap = _kpi_snapshot_at(
-        derived_df, start_date, end_date, now - timedelta(days=7),
+        derived_df, start_date, end_date, _now_min - timedelta(days=7),
     )
     _render_kpi_cards(open_df, closed_recent_df, prev_snap, start_date, end_date,
                       derived_df, jira_domain, reported_df)
@@ -2330,6 +2407,15 @@ def main() -> None:
     )
     _section_header("Share report", "Copy Outlook-ready summary to clipboard")
     _render_share_section(open_df, closed_recent_df, jira_domain)
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Client Issues Tracker",
+        page_icon="🚨",
+        layout="wide",
+    )
+    render_defect_sla()
 
 
 if __name__ == "__main__":
