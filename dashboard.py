@@ -599,7 +599,7 @@ def render_dev_table(curr_dev: pd.DataFrame, prev_dev: pd.DataFrame):
         st.info("No data for the selected period.")
         return
 
-    filtered = curr_dev.copy()
+    filtered = curr_dev.sort_values("Productivity %", ascending=False).reset_index(drop=True)
 
     def _badge(p):
         if p >= PROD_GREEN_THRESHOLD:
