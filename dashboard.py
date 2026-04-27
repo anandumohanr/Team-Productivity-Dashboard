@@ -1598,8 +1598,14 @@ def main():
                       jira_config["JIRA_API_TOKEN"], jira_config[OPTIONAL_BUG_FILTER_SECRET])
 
     def _prewarm_defect():
-        from defect_sla_dashboard import load_defect_data as _ldd
-        _ldd()
+        from defect_sla_dashboard import IST as _defect_ist
+        from defect_sla_dashboard import build_derived as _build_derived
+        from defect_sla_dashboard import load_defect_data as _load_defect_data
+
+        raw_df, _ = _load_defect_data()
+        if not raw_df.empty:
+            _now_min = datetime.now(_defect_ist).replace(second=0, microsecond=0)
+            _build_derived(raw_df, _now_min)
 
     def _prewarm_sprint():
         if _board_id:
