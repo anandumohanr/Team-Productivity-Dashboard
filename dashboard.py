@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -647,6 +646,32 @@ button[data-testid="stTab"][aria-selected="true"] {
 /* ── Generic card hover (applied where cards are used) ───────────── */
 .kpi-card:hover { box-shadow: 0 4px 16px rgba(99,102,241,.12) !important; }
 
+/* ── Clickable developer-row overlay (table rows in render_dev_table) ── */
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"][class*="st-key-btn_dev_row_"]) {
+    position: relative !important;
+    gap: 0 !important;
+    margin-top: -1rem !important;
+}
+[data-testid="stElementContainer"][class*="st-key-btn_dev_row_"] {
+    position: absolute !important; inset: 0 !important;
+    z-index: 10 !important; margin: 0 !important; padding: 0 !important;
+    pointer-events: none !important;
+}
+[class*="st-key-btn_dev_row_"] > div { height: 100% !important; margin: 0 !important; }
+[class*="st-key-btn_dev_row_"] > div > button {
+    height: 100% !important; width: 100% !important;
+    min-height: 0 !important;
+    background: transparent !important; border: none !important;
+    box-shadow: none !important; outline: none !important;
+    padding: 0 !important; cursor: pointer !important;
+    border-radius: 0 !important; pointer-events: auto !important;
+}
+[class*="st-key-btn_dev_row_"] > div > button:hover,
+[class*="st-key-btn_dev_row_"] > div > button:focus,
+[class*="st-key-btn_dev_row_"] > div > button:active {
+    background: transparent !important; box-shadow: none !important; outline: none !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -764,64 +789,65 @@ def render_kpi_cards(curr: dict, prev: dict):
 # Developer breakdown table
 # =====================
 
-def render_dev_table(curr_dev: pd.DataFrame, prev_dev: pd.DataFrame):
+def render_dev_table(
+    curr_dev: pd.DataFrame,
+    prev_dev: pd.DataFrame,
+    df: pd.DataFrame,
+    bugs_df: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+):
     if curr_dev.empty:
         st.info("No data for the selected period.")
         return
 
     filtered = curr_dev.sort_values("Productivity %", ascending=False).reset_index(drop=True)
+    n = len(filtered)
 
     def _badge(p):
         if p >= PROD_GREEN_THRESHOLD:
-            return '<span style="background:#dcfce7;color:#16a34a;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap">● High</span>'
+            return '<span style="display:inline-block;background:#dcfce7;color:#16a34a;padding:5px 12px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap">● High</span>'
         elif p >= PROD_YELLOW_THRESHOLD:
-            return '<span style="background:#fef3c7;color:#d97706;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap">● Mid</span>'
-        return '<span style="background:#fee2e2;color:#dc2626;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap">● Low</span>'
+            return '<span style="display:inline-block;background:#fef3c7;color:#d97706;padding:5px 12px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap">● Mid</span>'
+        return '<span style="display:inline-block;background:#fee2e2;color:#dc2626;padding:5px 12px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap">● Low</span>'
 
     def _progress(p):
         w = min(float(p), 100)
         clr = "#16a34a" if p >= PROD_GREEN_THRESHOLD else ("#d97706" if p >= PROD_YELLOW_THRESHOLD else "#dc2626")
         return (
-            f'<div style="display:flex;align-items:center;gap:8px;min-width:130px">'
-            f'<div style="flex:1;background:#e2e8f0;border-radius:4px;height:5px">'
-            f'<div style="width:{w:.0f}%;background:{clr};height:5px;border-radius:4px"></div>'
+            f'<div style="display:flex;align-items:center;gap:10px;width:100%;min-width:130px">'
+            f'<div style="flex:1;background:#e2e8f0;border-radius:4px;height:6px">'
+            f'<div style="width:{w:.0f}%;background:{clr};height:6px;border-radius:4px"></div>'
             f'</div>'
-            f'<span style="font-size:12px;color:#0f172a;min-width:40px;text-align:right;font-weight:600">{p:.1f}%</span>'
+            f'<span style="font-size:12px;color:#0f172a;min-width:48px;text-align:right;font-weight:600">{p:.1f}%</span>'
             f'</div>'
         )
 
-    th = "padding:10px 16px;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.07em;text-align:left;border-bottom:1px solid #e2e8f0;white-space:nowrap"
-    td = "padding:12px 16px;font-size:13px;color:#334155;border-bottom:1px solid #f1f5f9;vertical-align:middle"
+    # Shared column widths (sum to 100). table-layout:fixed + identical colgroup
+    # across every <table> guarantees columns line up across header + every row.
+    COL_WIDTHS = [10, 18, 11, 13, 22, 10, 16]
+    colgroup = "<colgroup>" + "".join(f'<col style="width:{w}%">' for w in COL_WIDTHS) + "</colgroup>"
 
-    rows = ""
-    for i, (_, r) in enumerate(filtered.iterrows()):
-        bg = "#f8fafc" if i % 2 == 0 else "#ffffff"
-        bug_clr = "#dc2626" if r["Bugs"] > 0 else "#94a3b8"
-        q = r["Quality Score"]
-        q_clr = "#16a34a" if q >= QUALITY_GREEN_THRESHOLD else ("#d97706" if q >= QUALITY_YELLOW_THRESHOLD else "#dc2626")
-        rows += (
-            f'<tr style="background:{bg}" '
-            f'onmouseover="this.style.background=\'#eff6ff\'" '
-            f'onmouseout="this.style.background=\'{bg}\'">'
-            f'<td style="{td}">{_badge(r["Productivity %"])}</td>'
-            f'<td style="{td};font-weight:600;color:#0f172a">{_html.escape(str(r["Developer"]))}</td>'
-            f'<td style="{td};text-align:center;font-size:13px;color:#64748b">{int(r["Target SP"])}</td>'
-            f'<td style="{td};text-align:center;font-weight:700;font-size:15px;color:#4f46e5">{int(r["Completed SP"])}</td>'
-            f'<td style="{td}">{_progress(r["Productivity %"])}</td>'
-            f'<td style="{td};text-align:center;font-weight:700;color:{bug_clr}">{r["Bugs"]}</td>'
-            f'<td style="{td};text-align:center">'
-            f'<span style="font-weight:700;font-size:14px;color:{q_clr}">{q}</span>'
-            f'<span style="font-size:11px;color:#94a3b8">/100</span>'
-            f'</td>'
-            f'</tr>'
-        )
+    th = (
+        "padding:16px 20px;font-size:11px;font-weight:600;color:#64748b;"
+        "text-transform:uppercase;letter-spacing:.07em;text-align:left;"
+        "white-space:nowrap;vertical-align:middle;background:#f8fafc;"
+        "border:1px solid #e2e8f0"
+    )
+    td = (
+        "padding:18px 20px;font-size:13px;color:#334155;vertical-align:middle;"
+        "border:1px solid #e2e8f0;border-top:0"
+    )
 
-    st.markdown(f"""
-<div style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;
-            overflow:hidden;overflow-x:auto;box-shadow:0 1px 4px rgba(0,0,0,.06)">
-  <table style="width:100%;border-collapse:collapse">
+    # Header table — top corners rounded, full borders so the seam below is one line.
+    st.markdown(
+        f"""
+<div class="dev-table-wrap" style="border-radius:12px 12px 0 0;overflow:hidden;
+            box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <table style="width:100%;border-collapse:collapse;table-layout:fixed">
+    {colgroup}
     <thead>
-      <tr style="background:#f8fafc">
+      <tr>
         <th style="{th}">Status</th>
         <th style="{th}">Developer</th>
         <th style="{th};text-align:center">Target SP</th>
@@ -831,15 +857,54 @@ def render_dev_table(curr_dev: pd.DataFrame, prev_dev: pd.DataFrame):
         <th style="{th};text-align:center">Quality Score</th>
       </tr>
     </thead>
-    <tbody>{rows}</tbody>
   </table>
-</div>""", unsafe_allow_html=True)
+</div>""",
+        unsafe_allow_html=True,
+    )
+
+    for i, (_, r) in enumerate(filtered.iterrows()):
+        bg = "#f8fafc" if i % 2 == 0 else "#ffffff"
+        bug_clr = "#dc2626" if r["Bugs"] > 0 else "#94a3b8"
+        q = r["Quality Score"]
+        q_clr = "#16a34a" if q >= QUALITY_GREEN_THRESHOLD else ("#d97706" if q >= QUALITY_YELLOW_THRESHOLD else "#dc2626")
+
+        is_last = (i == n - 1)
+        radius = "0 0 12px 12px" if is_last else "0"
+
+        with st.container():
+            st.markdown(
+                f"""
+<div class="dev-table-wrap" style="border-radius:{radius};overflow:hidden;
+            box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <table style="width:100%;border-collapse:collapse;table-layout:fixed;background:{bg}">
+    {colgroup}
+    <tbody>
+      <tr>
+        <td style="{td}">{_badge(r["Productivity %"])}</td>
+        <td style="{td};font-weight:600;color:#0f172a">{_html.escape(str(r["Developer"]))}</td>
+        <td style="{td};text-align:center;color:#64748b">{int(r["Target SP"])}</td>
+        <td style="{td};text-align:center;font-weight:700;font-size:15px;color:#4f46e5">{int(r["Completed SP"])}</td>
+        <td style="{td}">{_progress(r["Productivity %"])}</td>
+        <td style="{td};text-align:center;font-weight:700;color:{bug_clr}">{r["Bugs"]}</td>
+        <td style="{td};text-align:center"><span style="font-weight:700;font-size:14px;color:{q_clr}">{q}</span><span style="font-size:11px;color:#94a3b8;margin-left:2px">/100</span></td>
+      </tr>
+    </tbody>
+  </table>
+</div>""",
+                unsafe_allow_html=True,
+            )
+            if st.button(" ", key=f"btn_dev_row_{i}", use_container_width=True):
+                _show_dev_drilldown_dialog(
+                    r["Developer"], df, bugs_df, curr_dev, prev_dev, start_date, end_date,
+                )
 
 # =====================
 # Developer drill-down
 # =====================
 
-def render_dev_drilldown(
+@st.dialog("Developer Drill-Down", width="large")
+def _show_dev_drilldown_dialog(
+    selected: str,
     df: pd.DataFrame,
     bugs_df: pd.DataFrame,
     curr_dev: pd.DataFrame,
@@ -848,11 +913,13 @@ def render_dev_drilldown(
     end_date: date,
 ):
     """Single-developer deep dive: KPI cards, historical SP chart, task + bug tables."""
-    devs = sorted(df["Developer"].dropna().unique())
-    if not devs:
-        return
-
-    selected = st.selectbox("Select developer", devs, key="drilldown_dev")
+    st.markdown(
+        f"<div style='font-size:13px;color:#64748b;margin:-6px 0 14px 0'>"
+        f"<span style='font-weight:600;color:#0f172a'>{_html.escape(str(selected))}</span>"
+        f" · {start_date.strftime('%d %b')} – {end_date.strftime('%d %b %Y')}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
     row_curr = curr_dev[curr_dev["Developer"] == selected]
     row_prev = (
@@ -903,7 +970,12 @@ def render_dev_drilldown(
     st.markdown("<br>", unsafe_allow_html=True)
 
     # --- Historical SP + Bug chart ---
-    gran = st.selectbox("Granularity", ["Week", "Month", "Quarter"], index=1, key="drilldown_gran")
+    gran = st.selectbox(
+        "Granularity",
+        ["Week", "Month", "Quarter"],
+        index=1,
+        key=f"drilldown_gran_{selected}",
+    )
     dev_completed = df[(df["Developer"] == selected) & (df["Is Completed"])].copy()
 
     st.markdown(f"**{selected} — Completed SP & Bugs over time**")
@@ -1028,185 +1100,6 @@ def _period_capacity_sp(ts, gran: str) -> int:
             end = date(start.year, next_q_month, 1) - timedelta(days=1)
 
     return int(round(max(count_dev_days(start, end) * SP_BASELINE_PER_DAY, 1)))
-
-
-# =====================
-# Export / Share
-# =====================
-
-def render_share_section(period_label: str, team: dict, dev_df: pd.DataFrame):
-    """
-    One-click copy button (copies formatted HTML to clipboard) + inline preview.
-    Pasting into Outlook preserves table borders, colours, and layout.
-    """
-    import json
-
-    # Outlook uses Word's engine: bgcolor attribute beats CSS background,
-    # and <span> with explicit color beats inherited styles on <th>.
-    # font-weight:normal on every td prevents Outlook bold inheritance.
-    HDR_BG = "#1e3a5f"
-    td_base = "font-size:13px;border:1px solid #c8d0d8;padding:7px 12px;font-weight:normal;color:#111111"
-    td      = td_base
-    td_alt  = td_base + ";background:#f4f6f8"
-
-    def hdr(text):
-        """Header cell: <td> + bgcolor attr + white span — reliable in Outlook."""
-        return (
-            f'<td bgcolor="{HDR_BG}" style="background:{HDR_BG};padding:8px 12px;'
-            f'font-size:13px;border:1px solid #c8d0d8;text-align:left">'
-            f'<span style="color:#ffffff;font-weight:bold">{text}</span></td>'
-        )
-
-    kpi_cells = "".join(
-        f'<td style="{td}">{v}</td>'
-        for v in [
-            team["Completed SP"],
-            f"{team['Productivity %']}%",
-            team["Bugs"],
-            team["Quality Score"],
-        ]
-    )
-
-    dev_rows = ""
-    for i, (_, r) in enumerate(dev_df.sort_values("Productivity %", ascending=False).iterrows()):
-        cell = td_alt if i % 2 else td
-        dev_rows += (
-            f'<tr>'
-            f'<td style="{cell}">{_html.escape(str(r["Developer"]))}</td>'
-            f'<td style="{cell}">{int(r["Completed SP"])}</td>'
-            f'<td style="{cell}">{r["Productivity %"]:.1f}%</td>'
-            f'<td style="{cell}">{r["Bugs"]}</td>'
-            f'<td style="{cell}">{r["Quality Score"]}</td>'
-            f'</tr>'
-        )
-
-    report_html = (
-        f'<div style="font-family:Calibri,Arial,sans-serif;color:#111111;font-weight:normal">'
-        f'<p style="font-size:18px;font-weight:bold;margin-bottom:2px;color:#111111">Team Productivity Report</p>'
-        f'<p style="font-size:13px;color:#555555;font-weight:normal;margin-top:0;margin-bottom:14px">{period_label}</p>'
-        f'<p style="font-size:13px;font-weight:bold;margin-bottom:6px;color:#111111">Team Overview</p>'
-        f'<table style="border-collapse:collapse;margin-bottom:18px" cellpadding="0" cellspacing="0">'
-        f'<tr>{hdr("Completed SP")}{hdr("Productivity")}{hdr("Bugs")}{hdr("Quality Score")}</tr>'
-        f'<tr>{kpi_cells}</tr>'
-        f'</table>'
-        f'<p style="font-size:13px;font-weight:bold;margin-bottom:6px;color:#111111">Developer Breakdown</p>'
-        f'<table style="border-collapse:collapse;width:100%" cellpadding="0" cellspacing="0">'
-        f'<tr>{hdr("Developer")}{hdr("Completed SP")}{hdr("Productivity")}{hdr("Bugs")}{hdr("Quality Score")}</tr>'
-        f'{dev_rows}'
-        f'</table>'
-        f'<p style="font-size:11px;color:#999999;font-weight:normal;margin-top:10px">'
-        f'Generated {datetime.now().strftime("%d %b %Y %H:%M")}</p>'
-        f'</div>'
-    )
-
-    # Embed HTML as a JSON string so JS handles all escaping safely
-    html_json = json.dumps(report_html)
-    download_html = (
-        "<!doctype html><html><head><meta charset=\"utf-8\">"
-        "<title>Team Productivity Report</title></head><body>"
-        f"{report_html}"
-        "</body></html>"
-    )
-
-    components.html(f"""
-<button onclick="copyReport(this)"
-  style="background:#4f46e5;color:#fff;border:none;padding:10px 22px;
-         border-radius:6px;font-size:14px;cursor:pointer;font-family:sans-serif;
-         font-weight:600;letter-spacing:.02em">
-  📋 Copy Report
-</button>
-<span id="msg" style="margin-left:14px;font-size:13px;font-family:sans-serif"></span>
-<script>
-function copyReport(btn) {{
-  const html = {html_json};
-  navigator.clipboard.write([
-    new ClipboardItem({{
-      'text/html': new Blob([html], {{type: 'text/html'}})
-    }})
-  ]).then(() => {{
-    const msg = document.getElementById('msg');
-    msg.style.color = '#22c55e';
-    msg.textContent = '✓ Copied — paste into Outlook';
-    setTimeout(() => msg.textContent = '', 3000);
-  }}).catch(() => {{
-    const msg = document.getElementById('msg');
-    msg.style.color = '#ef4444';
-    msg.textContent = 'Copy failed - download HTML or select the preview below';
-  }});
-}}
-</script>
-""", height=52)
-
-    st.download_button(
-        "Download HTML fallback",
-        data=download_html.encode("utf-8"),
-        file_name="team_productivity_report.html",
-        mime="text/html",
-    )
-
-    st.markdown("**Preview**")
-    st.markdown(
-        f"""
-<div style="background:#ffffff;border:1px solid #d9e2ec;border-radius:8px;padding:16px;overflow-x:auto">
-{report_html}
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-
-# =====================
-# Raw data
-# =====================
-
-def render_raw_data(df: pd.DataFrame, bugs_df: pd.DataFrame, default_start: date, default_end: date):
-    col1, col2 = st.columns(2)
-    with col1:
-        raw_start = st.date_input("From", value=default_start, key="raw_start")
-    with col2:
-        raw_end = st.date_input("To", value=default_end, key="raw_end")
-
-    all_devs = sorted(df["Developer"].dropna().unique())
-    sel_devs = st.multiselect("Filter by developer (optional)", all_devs)
-
-    tasks_f = df[
-        (df["Due Date"].dt.date >= raw_start) &
-        (df["Due Date"].dt.date <= raw_end)
-    ].copy()
-    tasks_f["Due Date"] = tasks_f["Due Date"].dt.strftime("%d-%b-%Y").str.upper()
-
-    if bugs_df is not None and not bugs_df.empty:
-        bugs_f = bugs_df[
-            (bugs_df["Created"].dt.date >= raw_start) &
-            (bugs_df["Created"].dt.date <= raw_end)
-        ].copy()
-        bugs_f["Created"] = bugs_f["Created"].dt.strftime("%d-%b-%Y").str.upper()
-    else:
-        bugs_f = pd.DataFrame()
-
-    if sel_devs:
-        tasks_f = tasks_f[tasks_f["Developer"].isin(sel_devs)]
-        if not bugs_f.empty:
-            bugs_f = bugs_f[bugs_f["Developer"].isin(sel_devs)]
-
-    st.markdown("**Tasks**")
-    if not tasks_f.empty:
-        st.dataframe(
-            tasks_f[["Key", "Summary", "Developer", "Status", "Due Date", "Story Points"]],
-            use_container_width=True, hide_index=True,
-        )
-    else:
-        st.info("No tasks in this range.")
-
-    st.markdown("**Bugs**")
-    if not bugs_f.empty:
-        st.dataframe(
-            bugs_f[["Key", "Summary", "Developer", "Created"]],
-            use_container_width=True, hide_index=True,
-        )
-    else:
-        st.info("No bugs in this range.")
 
 
 # =====================
@@ -1764,30 +1657,12 @@ def main():
 
     DIVIDER = "<div style='height:1px;background:linear-gradient(90deg,#6366f1,transparent);margin:20px 0'></div>"
 
-    overview_tab, drill_tab, raw_tab, share_tab = st.tabs(
-        ["Overview", "Developer Drill-Down", "Raw Data", "Share Report"]
-    )
+    _section_header("Team Overview", period_label)
+    render_kpi_cards(curr_team, prev_team)
 
-    with overview_tab:
-        _section_header("Team Overview", period_label)
-        render_kpi_cards(curr_team, prev_team)
-
-        st.markdown(DIVIDER, unsafe_allow_html=True)
-        _section_header("Developer Breakdown", "Filtered individual performance metrics")
-        render_dev_table(curr_dev, prev_dev)
-
-    with drill_tab:
-        _section_header("Developer Drill-Down", "Single-developer trend, period tasks, and bugs")
-        render_dev_drilldown(df, bugs_df, curr_dev, prev_dev, start_date, end_date)
-
-    with raw_tab:
-        _section_header("Raw Data", "Task and bug records for audit checks")
-        render_raw_data(df, bugs_df, start_date, end_date)
-
-    with share_tab:
-        _section_header("Share Report", "Copy Outlook-ready summary or download the generated HTML")
-        st.markdown("<p style='font-size:12px;color:#64748b;margin-top:-8px;margin-bottom:12px'>Use the formatted preview below for email review before sharing.</p>", unsafe_allow_html=True)
-        render_share_section(period_label, curr_team, curr_dev)
+    st.markdown(DIVIDER, unsafe_allow_html=True)
+    _section_header("Developer Breakdown", "Click a row for individual drill-down")
+    render_dev_table(curr_dev, prev_dev, df, bugs_df, start_date, end_date)
 
 
 if __name__ == "__main__":
