@@ -50,6 +50,7 @@ ACTIONABLE_COMMITMENT_BUCKETS = {COMMITMENT_FRESH, COMMITMENT_CF_DEV}
 # Sprint planning capacity thresholds (per developer, per 2-week sprint)
 SPRINT_MIN_SP_PER_DEV = 7
 SPRINT_MAX_SP_PER_DEV = 10
+SPRINT_EXPECTED_SP_PER_DEV = 7
 
 # =====================
 # Data loading
@@ -621,7 +622,7 @@ def compute_planning_metrics(df: pd.DataFrame):
     is waiting on QE rather than consuming developer capacity.
     """
     base_cols = [
-        "Developer", "Committed SP", "Total Issues",
+        "Developer", "Committed SP", "Balance SP", "Total Issues",
         "Fresh SP", "CF Dev SP", "CF Test SP", "Utilization",
     ]
     empty_dev = pd.DataFrame(columns=base_cols)
@@ -688,9 +689,11 @@ def compute_planning_metrics(df: pd.DataFrame):
         ddf = df[df["Developer"] == dev]
         dev_summary = _commitment_summary(ddf)
         committed = dev_summary["actionable_sp"]
+        balance_sp = round(max(SPRINT_EXPECTED_SP_PER_DEV - committed, 0.0), 1)
         dev_rows.append({
             "Developer": dev,
             "Committed SP": committed,
+            "Balance SP": balance_sp,
             "Total Issues": len(ddf),
             "Fresh SP": dev_summary["fresh_sp"],
             "CF Dev SP": dev_summary["cf_dev_sp"],
@@ -1691,7 +1694,7 @@ def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
     td2 = ("padding:16px 18px;font-size:15px;color:#334155;vertical-align:middle;"
            "border:1px solid #e2e8f0;border-top:0")
 
-    col_widths = [20, 12, 10]
+    col_widths = [19, 11, 11, 9]
     if show_commitment_split:
         col_widths += [11, 11, 11]
     col_widths += [15]
@@ -1701,6 +1704,7 @@ def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
 
     headers_html = f'<th style="{th2}">Developer</th>'
     headers_html += f'<th style="{th2};text-align:center">Committed SP</th>'
+    headers_html += f'<th style="{th2};text-align:center">Balance SP</th>'
     headers_html += f'<th style="{th2};text-align:center"># Issues</th>'
     if show_commitment_split:
         headers_html += f'<th style="{th2};text-align:center">Fresh SP</th>'
@@ -1730,6 +1734,7 @@ def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
         radius = "0 0 12px 12px" if is_last else "0"
 
         committed = float(r["Committed SP"])
+        balance = float(r.get("Balance SP", 0))
         util_cell = _utilization_badge(r["Utilization"], committed)
 
         commitment_cells = ""
@@ -1753,6 +1758,7 @@ def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
       <tr>
         <td style="{td2};font-weight:600;color:#0f172a">{_html.escape(str(r["Developer"]))}</td>
         <td style="{td2};text-align:center;font-weight:700;font-size:17px;color:#6366f1">{committed:.1f}</td>
+        <td style="{td2};text-align:center;font-weight:700;font-size:17px;color:#16a34a">{balance:.1f}</td>
         <td style="{td2};text-align:center;color:#64748b">{int(r["Total Issues"])}</td>
         {commitment_cells}
         <td style="{td2};text-align:center">{util_cell}</td>
