@@ -41,6 +41,10 @@ DEV_DAY_RATIO = SPRINT_DEV_DAYS / SPRINT_WORKING_DAYS   # 0.7
 SPRINT_DONE_STATUSES = {"ACCEPTED IN QA", "CLOSED"}
 SPRINT_IN_PROGRESS_STATUSES = {"IN PROGRESS", "TEST", "DESIGN", "REVIEW", "IN REVIEW", "STAGING", "QA", "REOPENED"}
 
+# Sprint planning capacity thresholds (per developer, per 2-week sprint)
+SPRINT_MIN_SP_PER_DEV = 7
+SPRINT_MAX_SP_PER_DEV = 12
+
 # =====================
 # Data loading
 # =====================
@@ -256,7 +260,7 @@ def load_sprint_list(jira_domain: str, email: str, token: str, board_id: str) ->
     headers = {"Accept": "application/json"}
     all_sprints, start_at = [], 0
     while True:
-        params = {"state": "active,closed", "maxResults": 50, "startAt": start_at}
+        params = {"state": "active,closed,future", "maxResults": 50, "startAt": start_at}
         try:
             resp = requests.get(url, headers=headers, auth=auth, params=params)
             resp.raise_for_status()
@@ -468,7 +472,11 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
 
 def compute_sprint_metrics(df: pd.DataFrame):
     """Returns (team_dict, dev_df) for a sprint issues DataFrame."""
-    empty_dev = pd.DataFrame(columns=["Developer", "Committed SP", "Delivered SP", "Completion %", "Total Issues", "Done Issues"])
+    has_origin = "Origin" in df.columns
+    empty_cols = ["Developer", "Committed SP", "Delivered SP", "Completion %", "Total Issues", "Done Issues"]
+    if has_origin:
+        empty_cols += ["Fresh SP", "Carry-forward SP"]
+    empty_dev = pd.DataFrame(columns=empty_cols)
     if df.empty:
         return {"committed_sp": 0, "delivered_sp": 0, "completion_pct": 0.0, "total_issues": 0,
                 "done_issues": 0, "carryover_issues": 0, "active_devs": 0,
@@ -493,14 +501,20 @@ def compute_sprint_metrics(df: pd.DataFrame):
         committed = float(ddf["Story Points"].sum())
         delivered = float(ddf[ddf["Is Completed"]]["Story Points"].sum())
         cp = round(delivered / committed * 100, 1) if committed > 0 else 0.0
-        dev_rows.append({
+        row = {
             "Developer": dev,
             "Committed SP": round(committed, 1),
             "Delivered SP": round(delivered, 1),
             "Completion %": cp,
             "Total Issues": len(ddf),
             "Done Issues": int(ddf["Is Completed"].sum()),
-        })
+        }
+        if has_origin:
+            fresh = float(ddf[ddf["Origin"] == "New"]["Story Points"].sum())
+            cf = float(ddf[ddf["Origin"] == "Carry-forward"]["Story Points"].sum())
+            row["Fresh SP"] = round(fresh, 1)
+            row["Carry-forward SP"] = round(cf, 1)
+        dev_rows.append(row)
     dev_df = pd.DataFrame(dev_rows).sort_values("Committed SP", ascending=False).reset_index(drop=True)
     team = {
         "committed_sp": round(float(committed_sp), 1),
@@ -514,6 +528,67 @@ def compute_sprint_metrics(df: pd.DataFrame):
         "status_breakdown": status_breakdown,
     }
     return team, dev_df
+
+
+def compute_planning_metrics(df: pd.DataFrame):
+    """Returns (team_dict, dev_df) for the Planning lens.
+
+    Team dict surfaces commitment + readiness gaps (unestimated/unassigned).
+    Dev_df keeps only fields meaningful pre-execution (no Delivered/Completion %)
+    and adds a Utilization label per developer.
+    """
+    has_origin = "Origin" in df.columns
+    base_cols = ["Developer", "Committed SP", "Total Issues"]
+    if has_origin:
+        base_cols += ["Fresh SP", "Carry-forward SP"]
+    base_cols += ["Utilization"]
+    empty_dev = pd.DataFrame(columns=base_cols)
+    empty_team = {
+        "committed_sp": 0.0, "total_issues": 0, "active_devs": 0, "avg_sp_per_dev": 0.0,
+        "unestimated_count": 0, "unestimated_sp": 0.0,
+        "unassigned_count": 0, "unassigned_sp": 0.0,
+    }
+    if df.empty:
+        return empty_team, empty_dev
+
+    base_team, base_dev = compute_sprint_metrics(df)
+    committed_sp = base_team["committed_sp"]
+    total_issues = base_team["total_issues"]
+    active_devs = base_team["active_devs"]
+    avg_sp = round(committed_sp / active_devs, 1) if active_devs > 0 else 0.0
+
+    unestimated_mask = df["Story Points"] == 0
+    unassigned_mask = df["Developer"] == "(Unassigned)"
+    unestimated_count = int(unestimated_mask.sum())
+    unestimated_sp = round(float(df.loc[unestimated_mask, "Story Points"].sum()), 1)
+    unassigned_count = int(unassigned_mask.sum())
+    unassigned_sp = round(float(df.loc[unassigned_mask, "Story Points"].sum()), 1)
+
+    team = {
+        "committed_sp": committed_sp,
+        "total_issues": total_issues,
+        "active_devs": active_devs,
+        "avg_sp_per_dev": avg_sp,
+        "unestimated_count": unestimated_count,
+        "unestimated_sp": unestimated_sp,
+        "unassigned_count": unassigned_count,
+        "unassigned_sp": unassigned_sp,
+    }
+
+    if base_dev.empty:
+        return team, empty_dev
+
+    planning_dev = base_dev[base_dev["Developer"] != "(Unassigned)"].copy()
+    if planning_dev.empty:
+        return team, empty_dev
+
+    planning_dev["Utilization"] = planning_dev["Committed SP"].apply(_utilization_label)
+    keep_cols = ["Developer", "Committed SP", "Total Issues"]
+    if has_origin and "Fresh SP" in planning_dev.columns:
+        keep_cols += ["Fresh SP", "Carry-forward SP"]
+    keep_cols += ["Utilization"]
+    planning_dev = planning_dev[keep_cols].reset_index(drop=True)
+    return team, planning_dev
 
 
 # =====================
@@ -647,18 +722,22 @@ button[data-testid="stTab"][aria-selected="true"] {
 .kpi-card:hover { box-shadow: 0 4px 16px rgba(99,102,241,.12) !important; }
 
 /* ── Clickable developer-row overlay (table rows in render_dev_table) ── */
-[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"][class*="st-key-btn_dev_row_"]) {
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"][class*="st-key-btn_dev_row_"]),
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"][class*="st-key-plan_drill_"]) {
     position: relative !important;
     gap: 0 !important;
     margin-top: -1rem !important;
 }
-[data-testid="stElementContainer"][class*="st-key-btn_dev_row_"] {
+[data-testid="stElementContainer"][class*="st-key-btn_dev_row_"],
+[data-testid="stElementContainer"][class*="st-key-plan_drill_"] {
     position: absolute !important; inset: 0 !important;
     z-index: 10 !important; margin: 0 !important; padding: 0 !important;
     pointer-events: none !important;
 }
-[class*="st-key-btn_dev_row_"] > div { height: 100% !important; margin: 0 !important; }
-[class*="st-key-btn_dev_row_"] > div > button {
+[class*="st-key-btn_dev_row_"] > div,
+[class*="st-key-plan_drill_"] > div { height: 100% !important; margin: 0 !important; }
+[class*="st-key-btn_dev_row_"] > div > button,
+[class*="st-key-plan_drill_"] > div > button {
     height: 100% !important; width: 100% !important;
     min-height: 0 !important;
     background: transparent !important; border: none !important;
@@ -668,8 +747,78 @@ button[data-testid="stTab"][aria-selected="true"] {
 }
 [class*="st-key-btn_dev_row_"] > div > button:hover,
 [class*="st-key-btn_dev_row_"] > div > button:focus,
-[class*="st-key-btn_dev_row_"] > div > button:active {
+[class*="st-key-btn_dev_row_"] > div > button:active,
+[class*="st-key-plan_drill_"] > div > button:hover,
+[class*="st-key-plan_drill_"] > div > button:focus,
+[class*="st-key-plan_drill_"] > div > button:active {
     background: transparent !important; box-shadow: none !important; outline: none !important;
+}
+
+/* ── Sprint Lens segmented-control tabs (Planning ↔ Execution) ─────── */
+[data-testid="stHorizontalBlock"]:has([class*="st-key-lens_plan_"]) {
+    background: #f1f5f9 !important;
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 12px !important;
+    padding: 4px !important;
+    gap: 4px !important;
+    width: fit-content !important;
+    margin: 0 0 18px 0 !important;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,.04) !important;
+}
+[data-testid="stHorizontalBlock"]:has([class*="st-key-lens_plan_"]) [data-testid="stColumn"] {
+    width: auto !important;
+    flex: 0 0 auto !important;
+    min-width: 0 !important;
+    padding: 0 !important;
+}
+[data-testid="stHorizontalBlock"]:has([class*="st-key-lens_plan_"]) [data-testid="stColumn"]:nth-child(3) {
+    display: none !important;
+}
+[class*="st-key-lens_plan_on_"] > div > button,
+[class*="st-key-lens_exec_on_"] > div > button {
+    background: #ffffff !important;
+    color: #4f46e5 !important;
+    border: none !important;
+    box-shadow: 0 1px 3px rgba(0,0,0,.08), 0 0 0 1px rgba(99,102,241,.14) !important;
+    font-weight: 700 !important;
+    font-size: 13px !important;
+    letter-spacing: .01em !important;
+    border-radius: 8px !important;
+    padding: 9px 26px !important;
+    min-width: 158px !important;
+    height: auto !important;
+    transition: all .15s ease !important;
+}
+[class*="st-key-lens_plan_off_"] > div > button,
+[class*="st-key-lens_exec_off_"] > div > button {
+    background: transparent !important;
+    color: #64748b !important;
+    border: none !important;
+    box-shadow: none !important;
+    font-weight: 600 !important;
+    font-size: 13px !important;
+    letter-spacing: .01em !important;
+    border-radius: 8px !important;
+    padding: 9px 26px !important;
+    min-width: 158px !important;
+    height: auto !important;
+    transition: all .15s ease !important;
+}
+[class*="st-key-lens_plan_off_"] > div > button:hover,
+[class*="st-key-lens_exec_off_"] > div > button:hover {
+    background: rgba(255,255,255,.65) !important;
+    color: #334155 !important;
+    box-shadow: none !important;
+}
+[class*="st-key-lens_plan_on_"] > div > button:hover,
+[class*="st-key-lens_exec_on_"] > div > button:hover {
+    background: #ffffff !important;
+    color: #4338ca !important;
+    box-shadow: 0 2px 8px rgba(99,102,241,.18), 0 0 0 1px rgba(99,102,241,.18) !important;
+}
+[class*="st-key-lens_plan_"] > div > button:focus,
+[class*="st-key-lens_exec_"] > div > button:focus {
+    outline: none !important;
 }
 
 </style>
@@ -686,6 +835,47 @@ def _section_header(title: str, subtitle: str = ""):
   </div>
   {sub}
 </div>""", unsafe_allow_html=True)
+
+
+def _group_bg(g):
+    return {"Done": "#f0fdf4", "In Progress": "#fffbeb", "Not Delivered": "#fff1f2"}.get(g, "#ffffff")
+
+
+def _group_badge(g):
+    if g == "Done":
+        return '<span style="background:#dcfce7;color:#16a34a;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">Done</span>'
+    if g == "In Progress":
+        return '<span style="background:#fef3c7;color:#d97706;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">In Progress</span>'
+    if g == "Not Delivered":
+        return '<span style="background:#fee2e2;color:#dc2626;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">Not Delivered</span>'
+    return '<span style="background:#f1f5f9;color:#64748b;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">Not Started</span>'
+
+
+def _origin_badge(o):
+    if o == "Carry-forward":
+        return '<span style="background:#fff7ed;color:#c2410c;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">↩ Carry-forward</span>'
+    return '<span style="background:#eff6ff;color:#1d4ed8;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">New</span>'
+
+
+def _utilization_badge(util_label, sp):
+    palette = {
+        "Under": ("#fee2e2", "#dc2626"),
+        "Healthy": ("#dcfce7", "#16a34a"),
+        "Over": ("#fed7aa", "#ea580c"),
+    }
+    bg, fg = palette.get(util_label, ("#f1f5f9", "#64748b"))
+    return (
+        f'<span style="background:{bg};color:{fg};padding:3px 10px;border-radius:12px;'
+        f'font-size:11px;font-weight:700">{util_label.upper()} · {sp:.0f} SP</span>'
+    )
+
+
+def _utilization_label(committed_sp):
+    if committed_sp < SPRINT_MIN_SP_PER_DEV:
+        return "Under"
+    if committed_sp > SPRINT_MAX_SP_PER_DEV:
+        return "Over"
+    return "Healthy"
 
 
 # =====================
@@ -1055,6 +1245,94 @@ def _show_dev_drilldown_dialog(
             st.info("No bug data available.")
 
 
+@st.dialog("Sprint Task Drill-Down", width="large")
+def _show_sprint_dev_dialog(dev: str, sprint_name: str, dev_issues_df: pd.DataFrame,
+                             jira_domain: str):
+    """Single-developer sprint task list — no historical chart, just commitment."""
+    st.markdown(
+        f"<div style='font-size:13px;color:#64748b;margin:-6px 0 14px 0'>"
+        f"<span style='font-weight:600;color:#0f172a'>{_html.escape(dev)}</span> · "
+        f"{_html.escape(sprint_name)}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    if dev_issues_df.empty:
+        st.info("No issues assigned to this developer in this sprint.")
+        return
+
+    committed_sp = float(dev_issues_df["Story Points"].sum())
+    n_issues = len(dev_issues_df)
+    util_label = _utilization_label(committed_sp)
+
+    kpi_cols = st.columns(3)
+    kpi_cfg = [
+        ("Committed SP", f"{committed_sp:.1f}", "This sprint",         "#6366f1"),
+        ("Issues",       str(n_issues),         "Assigned to dev",     "#8b5cf6"),
+        ("Utilization",  util_label,            f"Target {SPRINT_MIN_SP_PER_DEV}–{SPRINT_MAX_SP_PER_DEV} SP", "#06b6d4"),
+    ]
+    for col, (label, value, sublabel, accent) in zip(kpi_cols, kpi_cfg):
+        with col:
+            st.markdown(f"""
+<div style="background:#ffffff;border-radius:10px;padding:14px;
+            border:1px solid #e2e8f0;border-left:4px solid {accent};
+            box-shadow:0 1px 3px rgba(0,0,0,.05)">
+  <div style="font-size:10px;color:#64748b;letter-spacing:.07em;text-transform:uppercase;
+              font-weight:600;margin-bottom:6px">{label}</div>
+  <div style="font-size:22px;font-weight:700;color:#0f172a;line-height:1;
+              margin-bottom:4px;letter-spacing:-.02em">{value}</div>
+  <div style="font-size:11px;color:#94a3b8;font-weight:500">{sublabel}</div>
+</div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    show_origin = "Origin" in dev_issues_df.columns
+    jira_base = f"https://{jira_domain}/browse/"
+    th = "padding:8px 12px;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.07em;text-align:left;border-bottom:1px solid #e2e8f0;white-space:nowrap"
+    td = "padding:10px 12px;font-size:13px;color:#334155;border-bottom:1px solid #f1f5f9;vertical-align:middle"
+
+    rows_html = ""
+    for _, r in dev_issues_df.iterrows():
+        sp_str = f"{r['Story Points']:.1f}" if r["Story Points"] > 0 else "—"
+        link = (f'<a href="{jira_base}{r["Key"]}" target="_blank" '
+                f'style="color:#6366f1;font-weight:600;text-decoration:none">'
+                f'{_html.escape(r["Key"])}</a>')
+        summ_full = str(r["Summary"])
+        summ = _html.escape(summ_full[:90]) + ("…" if len(summ_full) > 90 else "")
+        origin_cell = (f'<td style="{td}">{_origin_badge(r["Origin"])}</td>'
+                       if show_origin else "")
+        rows_html += (
+            f'<tr>'
+            f'<td style="{td};white-space:nowrap">{link}</td>'
+            f'<td style="{td};max-width:340px">{summ}</td>'
+            f'<td style="{td};white-space:nowrap">{_html.escape(r["Status"])}</td>'
+            f'<td style="{td}">{_group_badge(r["Status Group"])}</td>'
+            f'<td style="{td};text-align:center;font-weight:600;color:#4f46e5">{sp_str}</td>'
+            f'{origin_cell}'
+            f'</tr>'
+        )
+
+    origin_header = f'<th style="{th}">Origin</th>' if show_origin else ""
+    st.markdown(f"""
+<div style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;
+            overflow:hidden;overflow-x:auto;box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <table style="width:100%;border-collapse:collapse">
+    <thead>
+      <tr style="background:#f8fafc">
+        <th style="{th}">Key</th>
+        <th style="{th}">Summary</th>
+        <th style="{th}">Status</th>
+        <th style="{th}">Group</th>
+        <th style="{th};text-align:center">SP</th>
+        {origin_header}
+      </tr>
+    </thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+</div>
+""", unsafe_allow_html=True)
+
+
 # =====================
 # Trend charts
 # =====================
@@ -1098,6 +1376,353 @@ def _period_capacity_sp(ts, gran: str) -> int:
 # Sprint view
 # =====================
 
+def _default_sprint_tab(sprint_state: str, start_dt, today) -> str:
+    """Pick the default lens. Planning for future sprints and the first 3 days
+    of an active sprint; Execution otherwise."""
+    if sprint_state == "future":
+        return "Planning"
+    if sprint_state == "active" and start_dt is not None:
+        days_in = (today - start_dt).days
+        if 0 <= days_in < 3:
+            return "Planning"
+    return "Execution"
+
+
+def _render_sprint_lens_tabs(sprint_id, default_lens: str) -> str:
+    """Segmented-control style tabs for switching between Planning and Execution.
+    Active state is encoded into the button key so CSS can style each segment
+    differently. State persists in st.session_state per sprint."""
+    state_key = f"sprint_lens_{sprint_id}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = default_lens
+    active = st.session_state[state_key]
+
+    plan_suffix = "on" if active == "Planning" else "off"
+    exec_suffix = "on" if active == "Execution" else "off"
+
+    cols = st.columns([1, 1, 8])
+    with cols[0]:
+        if st.button("📋  Planning", key=f"lens_plan_{plan_suffix}_{sprint_id}",
+                     use_container_width=True):
+            if active != "Planning":
+                st.session_state[state_key] = "Planning"
+                st.rerun()
+    with cols[1]:
+        if st.button("▶  Execution", key=f"lens_exec_{exec_suffix}_{sprint_id}",
+                     use_container_width=True):
+            if active != "Execution":
+                st.session_state[state_key] = "Execution"
+                st.rerun()
+
+    return active
+
+
+def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
+                                    prev_sprint, jira_domain: str,
+                                    divider_html: str):
+    team, dev_df = compute_planning_metrics(issues_df)
+
+    _section_header(
+        "Sprint Planning",
+        f"{team['total_issues']} issues · {team['active_devs']} developers assigned",
+    )
+
+    kpi_cfg = [
+        ("Committed SP",  f"{team['committed_sp']:.1f}",
+            f"{team['total_issues']} issues",                                          "#6366f1", "SP"),
+        ("Devs Assigned", str(team['active_devs']),
+            "Excluding unassigned",                                                    "#8b5cf6", "DEV"),
+        ("Avg SP / Dev",  f"{team['avg_sp_per_dev']:.1f}",
+            f"Target {SPRINT_MIN_SP_PER_DEV}–{SPRINT_MAX_SP_PER_DEV}",                 "#06b6d4", "μ"),
+        ("Unestimated",   str(team['unestimated_count']),
+            f"{team['unestimated_count']} issue{'s' if team['unestimated_count'] != 1 else ''} missing SP",
+            "#f59e0b", "?"),
+        ("Unassigned",    str(team['unassigned_count']),
+            f"{team['unassigned_sp']:.1f} SP without owner",                           "#ef4444", "⚠"),
+    ]
+
+    kpi_cols = st.columns(len(kpi_cfg))
+    for col, (label, value, sublabel, accent, icon) in zip(kpi_cols, kpi_cfg):
+        with col:
+            st.markdown(f"""
+<div style="background:#ffffff;border-radius:12px;padding:18px 16px;
+            border:1px solid #e2e8f0;border-top:3px solid {accent};
+            position:relative;box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <div style="position:absolute;top:12px;right:12px;width:28px;height:28px;
+              background:{accent}18;border-radius:7px;display:flex;align-items:center;
+              justify-content:center;font-size:11px;font-weight:700;color:{accent}">{icon}</div>
+  <div style="font-size:10px;color:#64748b;letter-spacing:.07em;text-transform:uppercase;
+              font-weight:600;margin-bottom:8px">{label}</div>
+  <div style="font-size:26px;font-weight:700;color:#0f172a;line-height:1;
+              margin-bottom:8px;letter-spacing:-.02em">{value}</div>
+  <div style="font-size:11px;color:#94a3b8;font-weight:500">{sublabel}</div>
+</div>""", unsafe_allow_html=True)
+
+    st.markdown(divider_html, unsafe_allow_html=True)
+
+    show_origin_split = (prev_sprint is not None) and ("Fresh SP" in dev_df.columns)
+
+    _section_header("Developer Capacity", "Capacity utilization per developer")
+
+    if dev_df.empty:
+        st.markdown("""
+<div style="background:#fff7ed;border:1px solid #fdba74;border-radius:10px;padding:18px;
+            text-align:center;color:#9a3412;font-weight:500;margin-bottom:20px">
+  All committed issues are unassigned. Assign developers in Jira to see capacity utilization.
+</div>""", unsafe_allow_html=True)
+        return
+
+    th2 = ("padding:12px 14px;font-size:11px;font-weight:600;color:#64748b;"
+           "text-transform:uppercase;letter-spacing:.07em;text-align:left;"
+           "white-space:nowrap;background:#f8fafc;border:1px solid #e2e8f0")
+    td2 = ("padding:14px 16px;font-size:13px;color:#334155;vertical-align:middle;"
+           "border:1px solid #e2e8f0;border-top:0")
+
+    col_widths = [22, 13, 11]
+    if show_origin_split:
+        col_widths += [12, 14]
+    col_widths += [15]
+    total = sum(col_widths)
+    col_widths = [round(w / total * 100, 1) for w in col_widths]
+    colgroup = "<colgroup>" + "".join(f'<col style="width:{w}%">' for w in col_widths) + "</colgroup>"
+
+    headers_html = f'<th style="{th2}">Developer</th>'
+    headers_html += f'<th style="{th2};text-align:center">Committed SP</th>'
+    headers_html += f'<th style="{th2};text-align:center"># Issues</th>'
+    if show_origin_split:
+        headers_html += f'<th style="{th2};text-align:center">Fresh SP</th>'
+        headers_html += f'<th style="{th2};text-align:center">Carry-forward</th>'
+    headers_html += f'<th style="{th2};text-align:center">Utilization</th>'
+
+    st.markdown(f"""
+<div class="dev-table-wrap" style="border-radius:12px 12px 0 0;overflow:hidden;
+            box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <table style="width:100%;border-collapse:collapse;table-layout:fixed">
+    {colgroup}
+    <thead>
+      <tr>
+        {headers_html}
+      </tr>
+    </thead>
+  </table>
+</div>""", unsafe_allow_html=True)
+
+    n = len(dev_df)
+    issues_by_dev = {dev: ddf for dev, ddf in issues_df.groupby("Developer")}
+
+    for i, (_, r) in enumerate(dev_df.iterrows()):
+        bg = "#f8fafc" if i % 2 == 0 else "#ffffff"
+        is_last = (i == n - 1)
+        radius = "0 0 12px 12px" if is_last else "0"
+
+        committed = float(r["Committed SP"])
+        util_cell = _utilization_badge(r["Utilization"], committed)
+
+        origin_cells = ""
+        if show_origin_split:
+            fresh = float(r.get("Fresh SP", 0))
+            cf = float(r.get("Carry-forward SP", 0))
+            origin_cells = (
+                f'<td style="{td2};text-align:center;font-weight:600;color:#6366f1">{fresh:.1f}</td>'
+                f'<td style="{td2};text-align:center;font-weight:600;color:#f59e0b">{cf:.1f}</td>'
+            )
+
+        with st.container():
+            st.markdown(f"""
+<div class="dev-table-wrap" style="border-radius:{radius};overflow:hidden;
+            box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <table style="width:100%;border-collapse:collapse;table-layout:fixed;background:{bg}">
+    {colgroup}
+    <tbody>
+      <tr>
+        <td style="{td2};font-weight:600;color:#0f172a">{_html.escape(str(r["Developer"]))}</td>
+        <td style="{td2};text-align:center;font-weight:700;font-size:15px;color:#6366f1">{committed:.1f}</td>
+        <td style="{td2};text-align:center;color:#64748b">{int(r["Total Issues"])}</td>
+        {origin_cells}
+        <td style="{td2};text-align:center">{util_cell}</td>
+      </tr>
+    </tbody>
+  </table>
+</div>""", unsafe_allow_html=True)
+            if st.button(" ", key=f"plan_drill_{i}", use_container_width=True):
+                dev_issues = issues_by_dev.get(r["Developer"], pd.DataFrame())
+                _show_sprint_dev_dialog(
+                    r["Developer"], sprint_name, dev_issues, jira_domain,
+                )
+
+
+def render_sprint_execution_section(issues_df: pd.DataFrame, prev_sprint,
+                                     prev_sprint_name, cf_count: int, fresh_count: int,
+                                     fresh_sp: float, cf_sp: float,
+                                     jira_domain: str, divider_html: str):
+    team, dev_df = compute_sprint_metrics(issues_df)
+
+    _section_header("Sprint Metrics", f"{team['total_issues']} issues · {team['active_devs']} developers")
+    kpi_cols = st.columns(5)
+    kpi_cfg = [
+        ("Committed SP",  f"{team['committed_sp']:.1f}", "Total SP in sprint",        "#6366f1", "SP"),
+        ("Delivered SP",  f"{team['delivered_sp']:.1f}", f"{team['done_issues']} issues done", "#22c55e", "✓"),
+        ("Completion %",  f"{team['completion_pct']:.1f}%", "Delivered / Committed",  "#06b6d4", "%"),
+        ("Pending SP",    f"{team['carryover_sp']:.1f}", f"{team['carryover_issues']} issues not done", "#f59e0b", "→"),
+        ("Active Devs",   str(team['active_devs']),      "Contributors",               "#8b5cf6", "DEV"),
+    ]
+    for col, (label, value, sublabel, accent, icon) in zip(kpi_cols, kpi_cfg):
+        with col:
+            st.markdown(f"""
+<div style="background:#ffffff;border-radius:12px;padding:18px 16px;
+            border:1px solid #e2e8f0;border-top:3px solid {accent};
+            position:relative;box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <div style="position:absolute;top:12px;right:12px;width:28px;height:28px;
+              background:{accent}18;border-radius:7px;display:flex;align-items:center;
+              justify-content:center;font-size:11px;font-weight:700;color:{accent}">{icon}</div>
+  <div style="font-size:10px;color:#64748b;letter-spacing:.07em;text-transform:uppercase;
+              font-weight:600;margin-bottom:8px">{label}</div>
+  <div style="font-size:26px;font-weight:700;color:#0f172a;line-height:1;
+              margin-bottom:8px;letter-spacing:-.02em">{value}</div>
+  <div style="font-size:11px;color:#94a3b8;font-weight:500">{sublabel}</div>
+</div>""", unsafe_allow_html=True)
+
+    if prev_sprint and cf_count > 0:
+        prev_label = prev_sprint_name or "previous sprint"
+        _section_header("Sprint Composition", f"Fresh commitments vs carry-forward from {prev_label}")
+        comp_cols = st.columns(2)
+        comp_cfg = [
+            ("Fresh Commitment", f"{fresh_sp:.1f} SP", f"{fresh_count} new issues",                    "#6366f1"),
+            ("Carry-forward",    f"{cf_sp:.1f} SP",    f"{cf_count} issues from {prev_label}", "#f59e0b"),
+        ]
+        for col, (label, value, sublabel, accent) in zip(comp_cols, comp_cfg):
+            with col:
+                st.markdown(f"""
+<div style="background:#ffffff;border-radius:12px;padding:18px 16px;
+            border:1px solid #e2e8f0;border-left:4px solid {accent};
+            box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <div style="font-size:10px;color:#64748b;letter-spacing:.07em;text-transform:uppercase;
+              font-weight:600;margin-bottom:8px">{label}</div>
+  <div style="font-size:24px;font-weight:700;color:#0f172a;line-height:1;
+              margin-bottom:6px;letter-spacing:-.02em">{value}</div>
+  <div style="font-size:11px;color:#94a3b8;font-weight:500">{sublabel}</div>
+</div>""", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    st.markdown(divider_html, unsafe_allow_html=True)
+
+    show_origin_split = bool(prev_sprint) and cf_count > 0 and "Fresh SP" in dev_df.columns
+    breakdown_subtitle = (
+        "Fresh vs Carry-forward · Planned vs Delivered per developer"
+        if show_origin_split else "Planned vs Delivered per developer"
+    )
+    _section_header("Developer Breakdown", breakdown_subtitle)
+    if not dev_df.empty:
+        th2 = "padding:10px 14px;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.07em;text-align:left;border-bottom:1px solid #e2e8f0"
+        td2 = "padding:12px 14px;font-size:13px;color:#334155;border-bottom:1px solid #f1f5f9;vertical-align:middle"
+        dev_rows = ""
+        for i, (_, r) in enumerate(dev_df.iterrows()):
+            bg = "#f8fafc" if i % 2 == 0 else "#ffffff"
+            cp = r["Completion %"]
+            bar_clr = "#16a34a" if cp >= 80 else ("#d97706" if cp >= 60 else "#dc2626")
+            bar_w = min(float(cp), 100)
+            progress = (
+                f'<div style="display:flex;align-items:center;gap:6px;min-width:130px">'
+                f'<div style="flex:1;background:#e2e8f0;border-radius:4px;height:5px">'
+                f'<div style="width:{bar_w:.0f}%;background:{bar_clr};height:5px;border-radius:4px"></div>'
+                f'</div>'
+                f'<span style="font-size:12px;font-weight:600;color:#0f172a;min-width:40px;text-align:right">{cp:.1f}%</span>'
+                f'</div>'
+            )
+            origin_cells = ""
+            if show_origin_split:
+                origin_cells = (
+                    f'<td style="{td2};text-align:center;font-weight:600;color:#6366f1">{r["Fresh SP"]:.1f}</td>'
+                    f'<td style="{td2};text-align:center;font-weight:600;color:#f59e0b">{r["Carry-forward SP"]:.1f}</td>'
+                )
+            dev_rows += (
+                f'<tr style="background:{bg}">'
+                f'<td style="{td2};font-weight:600;color:#0f172a">{_html.escape(str(r["Developer"]))}</td>'
+                f'{origin_cells}'
+                f'<td style="{td2};text-align:center;font-weight:700;font-size:15px;color:#6366f1">{r["Committed SP"]:.1f}</td>'
+                f'<td style="{td2};text-align:center;font-weight:700;font-size:15px;color:#22c55e">{r["Delivered SP"]:.1f}</td>'
+                f'<td style="{td2}">{progress}</td>'
+                f'<td style="{td2};text-align:center;color:#64748b">{int(r["Done Issues"])}/{int(r["Total Issues"])}</td>'
+                f'</tr>'
+            )
+        origin_headers = (
+            f'<th style="{th2};text-align:center">Fresh SP</th>'
+            f'<th style="{th2};text-align:center">Carry-forward SP</th>'
+        ) if show_origin_split else ""
+        st.markdown(f"""
+<div style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;
+            overflow:hidden;overflow-x:auto;box-shadow:0 1px 4px rgba(0,0,0,.06);margin-bottom:20px">
+  <table style="width:100%;border-collapse:collapse">
+    <thead>
+      <tr style="background:#f8fafc">
+        <th style="{th2}">Developer</th>
+        {origin_headers}
+        <th style="{th2};text-align:center">Committed SP</th>
+        <th style="{th2};text-align:center">Delivered SP</th>
+        <th style="{th2}">Completion</th>
+        <th style="{th2};text-align:center">Issues Done</th>
+      </tr>
+    </thead>
+    <tbody>{dev_rows}</tbody>
+  </table>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(divider_html, unsafe_allow_html=True)
+
+    with st.expander(f"Sprint Issues  ({len(issues_df)} total)", expanded=False):
+        all_sprint_devs = sorted(issues_df["Developer"].dropna().unique())
+        sel_sprint_devs = st.multiselect("Filter by developer", all_sprint_devs, key="sprint_dev_filter")
+        display_df = issues_df.copy()
+        if sel_sprint_devs:
+            display_df = display_df[display_df["Developer"].isin(sel_sprint_devs)]
+
+        jira_base = f"https://{jira_domain}/browse/"
+        th3 = "padding:8px 12px;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.07em;text-align:left;border-bottom:1px solid #e2e8f0;white-space:nowrap"
+        td3 = "padding:10px 12px;font-size:13px;color:#334155;border-bottom:1px solid #f1f5f9;vertical-align:middle"
+
+        show_origin = prev_sprint is not None
+        issue_rows = ""
+        for _, r in display_df.iterrows():
+            bg = _group_bg(r["Status Group"])
+            sp_str = f"{r['Story Points']:.1f}" if r["Story Points"] > 0 else "—"
+            link = f'<a href="{jira_base}{r["Key"]}" target="_blank" style="color:#6366f1;font-weight:600;text-decoration:none">{_html.escape(r["Key"])}</a>'
+            summ = _html.escape(str(r["Summary"])[:90]) + ("…" if len(str(r["Summary"])) > 90 else "")
+            origin_cell = f'<td style="{td3}">{_origin_badge(r["Origin"])}</td>' if show_origin else ""
+            issue_rows += (
+                f'<tr style="background:{bg}">'
+                f'<td style="{td3};white-space:nowrap">{link}</td>'
+                f'<td style="{td3};max-width:340px">{summ}</td>'
+                f'<td style="{td3};white-space:nowrap">{_html.escape(r["Developer"])}</td>'
+                f'<td style="{td3};text-align:center;font-weight:600;color:#4f46e5">{sp_str}</td>'
+                f'<td style="{td3};white-space:nowrap">{_html.escape(r["Status"])}</td>'
+                f'<td style="{td3}">{_group_badge(r["Status Group"])}</td>'
+                f'{origin_cell}'
+                f'</tr>'
+            )
+
+        origin_header = f'<th style="{th3}">Origin</th>' if show_origin else ""
+        st.markdown(f"""
+<div style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;
+            overflow:hidden;overflow-x:auto;box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <table style="width:100%;border-collapse:collapse">
+    <thead>
+      <tr style="background:#f8fafc">
+        <th style="{th3}">Key</th>
+        <th style="{th3}">Summary</th>
+        <th style="{th3}">Developer</th>
+        <th style="{th3};text-align:center">SP</th>
+        <th style="{th3}">Status</th>
+        <th style="{th3}">Group</th>
+        {origin_header}
+      </tr>
+    </thead>
+    <tbody>{issue_rows}</tbody>
+  </table>
+</div>
+""", unsafe_allow_html=True)
+
+
 def render_sprint_view(jira_config: dict):
     board_id = _get_secret_value(OPTIONAL_BOARD_SECRET)
 
@@ -1135,8 +1760,23 @@ def render_sprint_view(jira_config: dict):
         except ValueError:
             start_dt = end_dt = None
         if state == "active":
-            days_left = (end_dt - today).days if end_dt else "?"
-            return f"▶ {name}  (Active · {days_left}d left)"
+            if end_dt:
+                days_left = (end_dt - today).days
+                if days_left < 0:
+                    suffix = f"Active · {abs(days_left)}d overdue"
+                elif days_left == 0:
+                    suffix = "Active · last day"
+                else:
+                    suffix = f"Active · {days_left}d left"
+            else:
+                suffix = "Active"
+            return f"▶ {name}  ({suffix})"
+        if state == "future":
+            if start_dt:
+                days_to_start = (start_dt - today).days
+                if days_to_start >= 0:
+                    return f"◔ {name}  (Upcoming · starts in {days_to_start}d)"
+            return f"◔ {name}  (Upcoming)"
         if start_dt and end_dt:
             return f"{name}  ({start_dt.strftime('%d %b')} – {end_dt.strftime('%d %b %Y')})"
         return name
@@ -1176,6 +1816,19 @@ def render_sprint_view(jira_config: dict):
             days_info = '<span style="font-size:12px;color:#f59e0b;font-weight:600;margin-left:8px">Last day</span>'
         else:
             days_info = f'<span style="font-size:13px;color:#64748b;margin-left:8px">{days_left} day{"s" if days_left != 1 else ""} remaining</span>'
+        progress_html = ""
+    elif sprint_state == "future":
+        state_badge = '<span style="background:#eef2ff;color:#6366f1;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700">◔ UPCOMING</span>'
+        if start_dt:
+            days_to_start = (start_dt - today).days
+            if days_to_start > 0:
+                days_info = f'<span style="font-size:13px;color:#64748b;margin-left:8px">starts in {days_to_start} day{"s" if days_to_start != 1 else ""}</span>'
+            elif days_to_start == 0:
+                days_info = '<span style="font-size:12px;color:#f59e0b;font-weight:600;margin-left:8px">starts today</span>'
+            else:
+                days_info = ""
+        else:
+            days_info = ""
         progress_html = ""
     else:
         state_badge = '<span style="background:#f1f5f9;color:#475569;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700">✓ CLOSED</span>'
@@ -1226,176 +1879,25 @@ def render_sprint_view(jira_config: dict):
     cf_count = int((issues_df["Origin"] == "Carry-forward").sum())
     fresh_count = int((issues_df["Origin"] == "New").sum())
 
-    team, dev_df = compute_sprint_metrics(issues_df)
+    # Lens choice — Planning is meaningless for closed sprints, so the toggle
+    # is hidden in that case and Execution renders directly. Active sprints
+    # default to Planning during the first 3 days of the window; future
+    # sprints always default to Planning.
+    if sprint_state == "closed":
+        active_lens = "Execution"
+    else:
+        default_lens = _default_sprint_tab(sprint_state, start_dt, today)
+        active_lens = _render_sprint_lens_tabs(sprint_id, default_lens)
 
-    # KPI cards
-    _section_header("Sprint Metrics", f"{team['total_issues']} issues · {team['active_devs']} developers")
-    kpi_cols = st.columns(5)
-    kpi_cfg = [
-        ("Committed SP",  f"{team['committed_sp']:.1f}", "Total SP in sprint",        "#6366f1", "SP"),
-        ("Delivered SP",  f"{team['delivered_sp']:.1f}", f"{team['done_issues']} issues done", "#22c55e", "✓"),
-        ("Completion %",  f"{team['completion_pct']:.1f}%", "Delivered / Committed",  "#06b6d4", "%"),
-        ("Pending SP",    f"{team['carryover_sp']:.1f}", f"{team['carryover_issues']} issues not done", "#f59e0b", "→"),
-        ("Active Devs",   str(team['active_devs']),      "Contributors",               "#8b5cf6", "DEV"),
-    ]
-    for col, (label, value, sublabel, accent, icon) in zip(kpi_cols, kpi_cfg):
-        with col:
-            st.markdown(f"""
-<div style="background:#ffffff;border-radius:12px;padding:18px 16px;
-            border:1px solid #e2e8f0;border-top:3px solid {accent};
-            position:relative;box-shadow:0 1px 4px rgba(0,0,0,.06)">
-  <div style="position:absolute;top:12px;right:12px;width:28px;height:28px;
-              background:{accent}18;border-radius:7px;display:flex;align-items:center;
-              justify-content:center;font-size:11px;font-weight:700;color:{accent}">{icon}</div>
-  <div style="font-size:10px;color:#64748b;letter-spacing:.07em;text-transform:uppercase;
-              font-weight:600;margin-bottom:8px">{label}</div>
-  <div style="font-size:26px;font-weight:700;color:#0f172a;line-height:1;
-              margin-bottom:8px;letter-spacing:-.02em">{value}</div>
-  <div style="font-size:11px;color:#94a3b8;font-weight:500">{sublabel}</div>
-</div>""", unsafe_allow_html=True)
-
-    # Sprint Composition (only shown when previous sprint data is available)
-    if prev_sprint and cf_count > 0:
-        prev_label = prev_sprint_name or "previous sprint"
-        _section_header("Sprint Composition", f"Fresh commitments vs carry-forward from {prev_label}")
-        comp_cols = st.columns(2)
-        comp_cfg = [
-            ("Fresh Commitment", f"{fresh_sp:.1f} SP", f"{fresh_count} new issues",                    "#6366f1"),
-            ("Carry-forward",    f"{cf_sp:.1f} SP",    f"{cf_count} issues from {prev_label}", "#f59e0b"),
-        ]
-        for col, (label, value, sublabel, accent) in zip(comp_cols, comp_cfg):
-            with col:
-                st.markdown(f"""
-<div style="background:#ffffff;border-radius:12px;padding:18px 16px;
-            border:1px solid #e2e8f0;border-left:4px solid {accent};
-            box-shadow:0 1px 4px rgba(0,0,0,.06)">
-  <div style="font-size:10px;color:#64748b;letter-spacing:.07em;text-transform:uppercase;
-              font-weight:600;margin-bottom:8px">{label}</div>
-  <div style="font-size:24px;font-weight:700;color:#0f172a;line-height:1;
-              margin-bottom:6px;letter-spacing:-.02em">{value}</div>
-  <div style="font-size:11px;color:#94a3b8;font-weight:500">{sublabel}</div>
-</div>""", unsafe_allow_html=True)
-        st.markdown("<br>", unsafe_allow_html=True)
-
-    st.markdown(DIVIDER, unsafe_allow_html=True)
-
-    # Developer breakdown table
-    _section_header("Developer Breakdown", "Planned vs Delivered per developer")
-    if not dev_df.empty:
-        th2 = "padding:10px 14px;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.07em;text-align:left;border-bottom:1px solid #e2e8f0"
-        td2 = "padding:12px 14px;font-size:13px;color:#334155;border-bottom:1px solid #f1f5f9;vertical-align:middle"
-        dev_rows = ""
-        for i, (_, r) in enumerate(dev_df.iterrows()):
-            bg = "#f8fafc" if i % 2 == 0 else "#ffffff"
-            cp = r["Completion %"]
-            bar_clr = "#16a34a" if cp >= 80 else ("#d97706" if cp >= 60 else "#dc2626")
-            bar_w = min(float(cp), 100)
-            progress = (
-                f'<div style="display:flex;align-items:center;gap:6px;min-width:130px">'
-                f'<div style="flex:1;background:#e2e8f0;border-radius:4px;height:5px">'
-                f'<div style="width:{bar_w:.0f}%;background:{bar_clr};height:5px;border-radius:4px"></div>'
-                f'</div>'
-                f'<span style="font-size:12px;font-weight:600;color:#0f172a;min-width:40px;text-align:right">{cp:.1f}%</span>'
-                f'</div>'
-            )
-            dev_rows += (
-                f'<tr style="background:{bg}">'
-                f'<td style="{td2};font-weight:600;color:#0f172a">{_html.escape(str(r["Developer"]))}</td>'
-                f'<td style="{td2};text-align:center;font-weight:700;font-size:15px;color:#6366f1">{r["Committed SP"]:.1f}</td>'
-                f'<td style="{td2};text-align:center;font-weight:700;font-size:15px;color:#22c55e">{r["Delivered SP"]:.1f}</td>'
-                f'<td style="{td2}">{progress}</td>'
-                f'<td style="{td2};text-align:center;color:#64748b">{int(r["Done Issues"])}/{int(r["Total Issues"])}</td>'
-                f'</tr>'
-            )
-        st.markdown(f"""
-<div style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;
-            overflow:hidden;overflow-x:auto;box-shadow:0 1px 4px rgba(0,0,0,.06);margin-bottom:20px">
-  <table style="width:100%;border-collapse:collapse">
-    <thead>
-      <tr style="background:#f8fafc">
-        <th style="{th2}">Developer</th>
-        <th style="{th2};text-align:center">Committed SP</th>
-        <th style="{th2};text-align:center">Delivered SP</th>
-        <th style="{th2}">Completion</th>
-        <th style="{th2};text-align:center">Issues Done</th>
-      </tr>
-    </thead>
-    <tbody>{dev_rows}</tbody>
-  </table>
-</div>
-""", unsafe_allow_html=True)
-
-    st.markdown(DIVIDER, unsafe_allow_html=True)
-
-    # Sprint issues table — collapsible
-    with st.expander(f"Sprint Issues  ({len(issues_df)} total)", expanded=False):
-        all_sprint_devs = sorted(issues_df["Developer"].dropna().unique())
-        sel_sprint_devs = st.multiselect("Filter by developer", all_sprint_devs, key="sprint_dev_filter")
-        display_df = issues_df.copy()
-        if sel_sprint_devs:
-            display_df = display_df[display_df["Developer"].isin(sel_sprint_devs)]
-
-        jira_base = f"https://{jira_domain}/browse/"
-        th3 = "padding:8px 12px;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.07em;text-align:left;border-bottom:1px solid #e2e8f0;white-space:nowrap"
-        td3 = "padding:10px 12px;font-size:13px;color:#334155;border-bottom:1px solid #f1f5f9;vertical-align:middle"
-
-        def _group_bg(g):
-            return {"Done": "#f0fdf4", "In Progress": "#fffbeb", "Not Delivered": "#fff1f2"}.get(g, "#ffffff")
-
-        def _group_badge(g):
-            if g == "Done":
-                return '<span style="background:#dcfce7;color:#16a34a;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">Done</span>'
-            if g == "In Progress":
-                return '<span style="background:#fef3c7;color:#d97706;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">In Progress</span>'
-            if g == "Not Delivered":
-                return '<span style="background:#fee2e2;color:#dc2626;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">Not Delivered</span>'
-            return '<span style="background:#f1f5f9;color:#64748b;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">Not Started</span>'
-
-        def _origin_badge(o):
-            if o == "Carry-forward":
-                return '<span style="background:#fff7ed;color:#c2410c;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">↩ Carry-forward</span>'
-            return '<span style="background:#eff6ff;color:#1d4ed8;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">New</span>'
-
-        show_origin = prev_sprint is not None
-        issue_rows = ""
-        for _, r in display_df.iterrows():
-            bg = _group_bg(r["Status Group"])
-            sp_str = f"{r['Story Points']:.1f}" if r["Story Points"] > 0 else "—"
-            link = f'<a href="{jira_base}{r["Key"]}" target="_blank" style="color:#6366f1;font-weight:600;text-decoration:none">{_html.escape(r["Key"])}</a>'
-            summ = _html.escape(str(r["Summary"])[:90]) + ("…" if len(str(r["Summary"])) > 90 else "")
-            origin_cell = f'<td style="{td3}">{_origin_badge(r["Origin"])}</td>' if show_origin else ""
-            issue_rows += (
-                f'<tr style="background:{bg}">'
-                f'<td style="{td3};white-space:nowrap">{link}</td>'
-                f'<td style="{td3};max-width:340px">{summ}</td>'
-                f'<td style="{td3};white-space:nowrap">{_html.escape(r["Developer"])}</td>'
-                f'<td style="{td3};text-align:center;font-weight:600;color:#4f46e5">{sp_str}</td>'
-                f'<td style="{td3};white-space:nowrap">{_html.escape(r["Status"])}</td>'
-                f'<td style="{td3}">{_group_badge(r["Status Group"])}</td>'
-                f'{origin_cell}'
-                f'</tr>'
-            )
-
-        origin_header = f'<th style="{th3}">Origin</th>' if show_origin else ""
-        st.markdown(f"""
-<div style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;
-            overflow:hidden;overflow-x:auto;box-shadow:0 1px 4px rgba(0,0,0,.06)">
-  <table style="width:100%;border-collapse:collapse">
-    <thead>
-      <tr style="background:#f8fafc">
-        <th style="{th3}">Key</th>
-        <th style="{th3}">Summary</th>
-        <th style="{th3}">Developer</th>
-        <th style="{th3};text-align:center">SP</th>
-        <th style="{th3}">Status</th>
-        <th style="{th3}">Group</th>
-        {origin_header}
-      </tr>
-    </thead>
-    <tbody>{issue_rows}</tbody>
-  </table>
-</div>
-""", unsafe_allow_html=True)
+    if active_lens == "Planning":
+        render_sprint_planning_section(
+            issues_df, sprint_name, prev_sprint, jira_domain, DIVIDER,
+        )
+    else:
+        render_sprint_execution_section(
+            issues_df, prev_sprint, prev_sprint_name,
+            cf_count, fresh_count, fresh_sp, cf_sp, jira_domain, DIVIDER,
+        )
 
 
 # =====================
