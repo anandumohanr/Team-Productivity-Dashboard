@@ -43,7 +43,7 @@ SPRINT_IN_PROGRESS_STATUSES = {"IN PROGRESS", "TEST", "DESIGN", "REVIEW", "IN RE
 
 # Sprint planning capacity thresholds (per developer, per 2-week sprint)
 SPRINT_MIN_SP_PER_DEV = 7
-SPRINT_MAX_SP_PER_DEV = 12
+SPRINT_MAX_SP_PER_DEV = 10
 
 # =====================
 # Data loading
@@ -754,16 +754,74 @@ button[data-testid="stTab"][aria-selected="true"] {
     background: transparent !important; box-shadow: none !important; outline: none !important;
 }
 
-/* ── Sprint Lens segmented-control tabs (Planning ↔ Execution) ─────── */
+/* ── Sprint Hero Card (header above the lens tabs) ──────────────────── */
+.sprint-hero-card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-left: 4px solid #94a3b8;
+    box-shadow: 0 2px 8px rgba(0,0,0,.06);
+    padding: 14px 22px;
+}
+.sprint-hero-card-standalone {
+    border-radius: 14px;
+    margin-bottom: 16px;
+}
+.sprint-hero-card-with-tabs {
+    border-radius: 14px 14px 0 0;
+    border-bottom: 1px solid #e2e8f0;
+    margin-bottom: 0;
+    /* Clip the bottom of the shadow so it doesn't bleed into the tab strip below */
+    clip-path: inset(-20px -20px 0 -20px);
+}
+.sprint-hero-card .hero-row {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    flex-wrap: wrap;
+    row-gap: 6px;
+}
+.sprint-hero-card .hero-name-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.sprint-hero-card .hero-name {
+    font-size: 17px;
+    font-weight: 700;
+    color: #0f172a;
+    letter-spacing: -.01em;
+    line-height: 1.2;
+}
+.sprint-hero-card .hero-meta {
+    font-size: 13px;
+    color: #64748b;
+    line-height: 1.4;
+}
+.sprint-hero-card .hero-stats {
+    font-size: 13px;
+    color: #475569;
+    font-weight: 500;
+    line-height: 1.4;
+}
+.sprint-hero-card .hero-sep {
+    color: #cbd5e1;
+    user-select: none;
+    margin: 0 2px;
+}
+
+/* ── Attached underline tabs (Planning ↔ Execution) ─────────────────── */
 [data-testid="stHorizontalBlock"]:has([class*="st-key-lens_plan_"]) {
-    background: #f1f5f9 !important;
+    background: #ffffff !important;
     border: 1px solid #e2e8f0 !important;
-    border-radius: 12px !important;
-    padding: 4px !important;
+    border-top: none !important;
+    border-radius: 0 0 14px 14px !important;
+    padding: 0 22px !important;
     gap: 4px !important;
-    width: fit-content !important;
-    margin: 0 0 18px 0 !important;
-    box-shadow: inset 0 1px 2px rgba(0,0,0,.04) !important;
+    width: auto !important;
+    margin: 0 0 16px 0 !important;
+    box-shadow: 0 2px 8px rgba(0,0,0,.06) !important;
+    /* Clip the top of the shadow so it doesn't bleed onto the card above */
+    clip-path: inset(0 -20px -20px -20px) !important;
 }
 [data-testid="stHorizontalBlock"]:has([class*="st-key-lens_plan_"]) [data-testid="stColumn"] {
     width: auto !important;
@@ -776,45 +834,47 @@ button[data-testid="stTab"][aria-selected="true"] {
 }
 [class*="st-key-lens_plan_on_"] > div > button,
 [class*="st-key-lens_exec_on_"] > div > button {
-    background: #ffffff !important;
+    background: transparent !important;
     color: #4f46e5 !important;
     border: none !important;
-    box-shadow: 0 1px 3px rgba(0,0,0,.08), 0 0 0 1px rgba(99,102,241,.14) !important;
+    border-bottom: 3px solid #6366f1 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
     font-weight: 700 !important;
     font-size: 13px !important;
-    letter-spacing: .01em !important;
-    border-radius: 8px !important;
-    padding: 9px 26px !important;
-    min-width: 158px !important;
+    letter-spacing: .015em !important;
+    padding: 16px 26px 13px !important;
     height: auto !important;
-    transition: all .15s ease !important;
+    transition: color .25s ease, border-color .25s ease, background .2s ease !important;
 }
 [class*="st-key-lens_plan_off_"] > div > button,
 [class*="st-key-lens_exec_off_"] > div > button {
     background: transparent !important;
     color: #64748b !important;
     border: none !important;
+    border-bottom: 3px solid transparent !important;
+    border-radius: 0 !important;
     box-shadow: none !important;
     font-weight: 600 !important;
     font-size: 13px !important;
     letter-spacing: .01em !important;
-    border-radius: 8px !important;
-    padding: 9px 26px !important;
-    min-width: 158px !important;
+    padding: 16px 26px 13px !important;
     height: auto !important;
-    transition: all .15s ease !important;
+    transition: color .25s ease, border-color .25s ease, background .2s ease !important;
 }
 [class*="st-key-lens_plan_off_"] > div > button:hover,
 [class*="st-key-lens_exec_off_"] > div > button:hover {
-    background: rgba(255,255,255,.65) !important;
+    background: rgba(99,102,241,.04) !important;
     color: #334155 !important;
+    border-bottom-color: #cbd5e1 !important;
     box-shadow: none !important;
 }
 [class*="st-key-lens_plan_on_"] > div > button:hover,
 [class*="st-key-lens_exec_on_"] > div > button:hover {
-    background: #ffffff !important;
+    background: rgba(99,102,241,.06) !important;
     color: #4338ca !important;
-    box-shadow: 0 2px 8px rgba(99,102,241,.18), 0 0 0 1px rgba(99,102,241,.18) !important;
+    border-bottom-color: #4f46e5 !important;
+    box-shadow: none !important;
 }
 [class*="st-key-lens_plan_"] > div > button:focus,
 [class*="st-key-lens_exec_"] > div > button:focus {
@@ -864,9 +924,15 @@ def _utilization_badge(util_label, sp):
         "Over": ("#fed7aa", "#ea580c"),
     }
     bg, fg = palette.get(util_label, ("#f1f5f9", "#64748b"))
+    if util_label == "Under":
+        body = f"{sp:.1f} / {SPRINT_MIN_SP_PER_DEV} SP"
+    elif util_label == "Over":
+        body = f"{sp:.1f} / {SPRINT_MAX_SP_PER_DEV} SP"
+    else:
+        body = f"{sp:.1f} SP"
     return (
         f'<span style="background:{bg};color:{fg};padding:3px 10px;border-radius:12px;'
-        f'font-size:11px;font-weight:700">{util_label.upper()} · {sp:.0f} SP</span>'
+        f'font-size:11px;font-weight:700">{util_label.upper()} · {body}</span>'
     )
 
 
@@ -876,6 +942,10 @@ def _utilization_label(committed_sp):
     if committed_sp > SPRINT_MAX_SP_PER_DEV:
         return "Over"
     return "Healthy"
+
+
+def _sprint_state_accent(sprint_state: str) -> str:
+    return {"active": "#22c55e", "future": "#6366f1"}.get(sprint_state, "#94a3b8")
 
 
 # =====================
@@ -1805,49 +1875,89 @@ def render_sprint_view(jira_config: dict):
 
     date_range_str = f"{start_dt.strftime('%d %b')} – {end_dt.strftime('%d %b %Y')}" if (start_dt and end_dt) else ""
 
+    # State badge — visual pill on the right of row 1
     if sprint_state == "active":
-        state_badge = '<span style="background:#dcfce7;color:#16a34a;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700">● ACTIVE</span>'
-        days_left = (end_dt - today).days if end_dt else None
-        if days_left is None:
-            days_info = ""
-        elif days_left < 0:
-            days_info = f'<span style="font-size:12px;color:#dc2626;font-weight:600;margin-left:8px">⚠ {abs(days_left)} day{"s" if abs(days_left) != 1 else ""} overdue</span>'
-        elif days_left == 0:
-            days_info = '<span style="font-size:12px;color:#f59e0b;font-weight:600;margin-left:8px">Last day</span>'
-        else:
-            days_info = f'<span style="font-size:13px;color:#64748b;margin-left:8px">{days_left} day{"s" if days_left != 1 else ""} remaining</span>'
-        progress_html = ""
+        state_badge = '<span style="background:#dcfce7;color:#16a34a;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700;white-space:nowrap">● ACTIVE</span>'
     elif sprint_state == "future":
-        state_badge = '<span style="background:#eef2ff;color:#6366f1;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700">◔ UPCOMING</span>'
-        if start_dt:
-            days_to_start = (start_dt - today).days
-            if days_to_start > 0:
-                days_info = f'<span style="font-size:13px;color:#64748b;margin-left:8px">starts in {days_to_start} day{"s" if days_to_start != 1 else ""}</span>'
-            elif days_to_start == 0:
-                days_info = '<span style="font-size:12px;color:#f59e0b;font-weight:600;margin-left:8px">starts today</span>'
-            else:
-                days_info = ""
-        else:
-            days_info = ""
-        progress_html = ""
+        state_badge = '<span style="background:#eef2ff;color:#6366f1;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700;white-space:nowrap">◔ UPCOMING</span>'
     else:
-        state_badge = '<span style="background:#f1f5f9;color:#475569;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700">✓ CLOSED</span>'
-        days_info = ""
-        progress_html = ""
+        state_badge = '<span style="background:#f1f5f9;color:#475569;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700;white-space:nowrap">✓ CLOSED</span>'
 
-    st.markdown(f"""
-<div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:10px;padding:14px 20px;margin-bottom:16px">
-  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-    <span style="font-size:15px;font-weight:700;color:#0f172a">{_html.escape(sprint_name)}</span>
-    <span style="font-size:13px;color:#64748b">{date_range_str}</span>
-    {state_badge}{days_info}
-  </div>
-  {progress_html}
-</div>
-""", unsafe_allow_html=True)
+    # Days info — plain text (with optional accent color) for row 2
+    days_text = ""
+    days_color = None
+    if sprint_state == "active" and end_dt:
+        days_left = (end_dt - today).days
+        if days_left < 0:
+            days_text = f'⚠ {abs(days_left)} day{"s" if abs(days_left) != 1 else ""} overdue'
+            days_color = "#dc2626"
+        elif days_left == 0:
+            days_text = "Last day"
+            days_color = "#f59e0b"
+        else:
+            days_text = f'{days_left} day{"s" if days_left != 1 else ""} remaining'
+    elif sprint_state == "future" and start_dt:
+        days_to_start = (start_dt - today).days
+        if days_to_start > 0:
+            days_text = f'starts in {days_to_start} day{"s" if days_to_start != 1 else ""}'
+        elif days_to_start == 0:
+            days_text = "starts today"
+            days_color = "#f59e0b"
 
+    # Load issues now (before rendering the hero card) so we can include
+    # summary stats inline. Stats are cheap to compute from the resulting df.
     with st.spinner(f"Loading issues for {sprint_name}…"):
         issues_df = load_sprint_issues(jira_domain, email, token, sprint_id)
+
+    if issues_df.empty:
+        total_issues, active_devs_count, committed_sp_total = 0, 0, 0.0
+    else:
+        total_issues = len(issues_df)
+        active_devs_count = sum(
+            1 for d in issues_df["Developer"].dropna().unique() if d != "(Unassigned)"
+        )
+        committed_sp_total = float(issues_df["Story Points"].sum())
+
+    # Hero card — three-row layout with a state-color left accent. Tabs follow
+    # only when there's actual content to lens (not closed, not empty).
+    has_tabs = sprint_state != "closed" and not issues_df.empty
+    accent_color = _sprint_state_accent(sprint_state)
+    card_modifier = "sprint-hero-card-with-tabs" if has_tabs else "sprint-hero-card-standalone"
+
+    row2_parts = []
+    if date_range_str:
+        row2_parts.append(_html.escape(date_range_str))
+    if days_text:
+        if days_color:
+            row2_parts.append(
+                f'<span style="color:{days_color};font-weight:600">{_html.escape(days_text)}</span>'
+            )
+        else:
+            row2_parts.append(_html.escape(days_text))
+    row2_html = " · ".join(row2_parts) if row2_parts else "&nbsp;"
+
+    issue_word = "issue" if total_issues == 1 else "issues"
+    dev_word = "dev" if active_devs_count == 1 else "devs"
+    row3_html = (
+        f'{total_issues} {issue_word} · {active_devs_count} {dev_word} · '
+        f'{committed_sp_total:.1f} SP committed'
+    )
+
+    meta_html = f'<div class="hero-meta">{row2_html}</div>' if row2_parts else ""
+    stats_html = f'<div class="hero-stats">{row3_html}</div>' if not issues_df.empty else ""
+
+    st.markdown(f"""
+<div class="sprint-hero-card {card_modifier}" style="border-left-color:{accent_color}">
+  <div class="hero-row">
+    <div class="hero-name-group">
+      <span class="hero-name">{_html.escape(sprint_name)}</span>
+      {state_badge}
+    </div>
+    {meta_html}
+    {stats_html}
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
     if issues_df.empty:
         st.info("No issues found for this sprint.")
