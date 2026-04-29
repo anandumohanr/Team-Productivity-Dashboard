@@ -726,62 +726,54 @@ def render_kpi_cards(curr: dict, prev: dict):
         else:
             dstr, is_pos = "—", None
 
-        delta_color = "#16a34a" if is_pos is True else ("#dc2626" if is_pos is False else "#64748b")
-        delta_bg    = "#dcfce7" if is_pos is True else ("#fee2e2" if is_pos is False else "#f1f5f9")
+        delta_color = "#16a34a" if is_pos is True else ("#dc2626" if is_pos is False else "#94a3b8")
         display_val = f"{val:.1f}%" if "%" in key else str(int(round(val)))
 
         if key == "Active Devs":
-            bottom_html = (
-                f'<div style="display:inline-block;background:#ede9fe;border-radius:20px;'
-                f'padding:3px 10px;font-size:11px;color:#8b5cf6;font-weight:600">'
-                f'contributors with assigned work</div>'
+            sublabel_html = (
+                f'<div style="font-size:11px;color:#94a3b8;font-weight:500;'
+                f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">with assigned work</div>'
             )
         elif key == "Capacity SP":
-            bottom_html = (
-                f'<div style="display:inline-block;background:#f1f5f9;border-radius:20px;'
-                f'padding:3px 10px;font-size:11px;color:#475569;font-weight:600">'
-                f'dev-day baseline</div>'
+            sublabel_html = (
+                f'<div style="font-size:11px;color:#94a3b8;font-weight:500;'
+                f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">dev-day baseline</div>'
             )
         elif key == "Completed SP":
             cap = int(round(curr.get("Capacity SP", 0)))
             display_val = str(int(round(val)))
-            bottom_html = (
-                f'<div style="display:inline-block;background:#eef2ff;border-radius:20px;'
-                f'padding:3px 10px;font-size:11px;color:#4f46e5;font-weight:600">'
+            sublabel_html = (
+                f'<div style="font-size:11px;color:#94a3b8;font-weight:500;'
+                f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'
                 f'{int(round(val))} / {cap} SP capacity</div>'
             )
         elif key == "Quality Score":
             display_val = f'{int(round(val))}'
-            bottom_html = (
-                f'<div style="display:inline-block;background:{delta_bg};border-radius:20px;'
-                f'padding:3px 10px;font-size:11px;color:{delta_color};font-weight:600">'
-                f'{dstr} vs prev period</div>'
+            sublabel_html = (
+                f'<div style="font-size:11px;color:{delta_color};font-weight:600;'
+                f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{dstr} vs prev</div>'
             )
         else:
-            bottom_html = (
-                f'<div style="display:inline-block;background:{delta_bg};border-radius:20px;'
-                f'padding:3px 10px;font-size:11px;color:{delta_color};font-weight:600">'
-                f'{dstr} vs prev period</div>'
+            sublabel_html = (
+                f'<div style="font-size:11px;color:{delta_color};font-weight:600;'
+                f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{dstr} vs prev</div>'
             )
 
         with col:
             st.markdown(f"""
 <div style="background:#ffffff;border-radius:12px;padding:18px 16px;
-            border:1px solid #e2e8f0;
-            box-shadow:0 2px 8px rgba(0,0,0,.07);
-            display:flex;align-items:flex-start;gap:14px;
-            transition:box-shadow .2s ease">
-  <div style="width:44px;height:44px;background:{accent}18;border-radius:10px;
-              display:flex;align-items:center;justify-content:center;
-              font-size:13px;font-weight:800;color:{accent};
-              flex-shrink:0;letter-spacing:-.01em">{icon}</div>
-  <div style="flex:1;min-width:0">
-    <div style="font-size:11px;color:#64748b;letter-spacing:.07em;
-                text-transform:uppercase;font-weight:600;margin-bottom:4px">{key}</div>
-    <div style="font-size:26px;font-weight:700;color:#0f172a;
-                line-height:1;margin-bottom:8px;letter-spacing:-.02em">{display_val}</div>
-    {bottom_html}
-  </div>
+            border:1px solid #e2e8f0;border-top:3px solid {accent};
+            position:relative;box-shadow:0 1px 4px rgba(0,0,0,.06);
+            min-height:118px">
+  <div style="position:absolute;top:12px;right:12px;width:28px;height:28px;
+              background:{accent}18;border-radius:7px;display:flex;align-items:center;
+              justify-content:center;font-size:11px;font-weight:700;color:{accent}">{icon}</div>
+  <div style="font-size:10px;color:#64748b;letter-spacing:.07em;text-transform:uppercase;
+              font-weight:600;margin-bottom:8px;padding-right:36px;
+              white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{key}</div>
+  <div style="font-size:26px;font-weight:700;color:#0f172a;line-height:1;
+              margin-bottom:8px;letter-spacing:-.02em">{display_val}</div>
+  {sublabel_html}
 </div>""", unsafe_allow_html=True)
 
 
