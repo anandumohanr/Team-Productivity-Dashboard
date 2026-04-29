@@ -558,21 +558,32 @@ def _commitment_summary(df: pd.DataFrame) -> dict:
 def compute_sprint_metrics(df: pd.DataFrame):
     """Returns (team_dict, dev_df) for a sprint issues DataFrame."""
     has_origin = "Origin" in df.columns
+    has_commitment = "Commitment Bucket" in df.columns
     empty_cols = ["Developer", "Committed SP", "Delivered SP", "Completion %", "Total Issues", "Done Issues"]
     if has_origin:
         empty_cols += ["Fresh SP", "Carry-forward SP"]
+    if has_commitment:
+        empty_cols += ["CF Dev SP", "CF Test SP"]
     empty_dev = pd.DataFrame(columns=empty_cols)
     if df.empty:
         return {"committed_sp": 0, "delivered_sp": 0, "completion_pct": 0.0, "total_issues": 0,
                 "done_issues": 0, "carryover_issues": 0, "active_devs": 0,
                 "status_breakdown": {"Done": 0, "In Progress": 0, "Not Started": 0}}, empty_dev
 
-    committed_sp = df["Story Points"].sum()
-    delivered_sp = df[df["Is Completed"]]["Story Points"].sum()
+    if has_commitment:
+        actionable_mask = df["Commitment Bucket"].isin(ACTIONABLE_COMMITMENT_BUCKETS)
+        summary = _commitment_summary(df)
+        committed_sp = summary["actionable_sp"]
+        delivered_sp = df[actionable_mask & df["Is Completed"]]["Story Points"].sum()
+        done_issues = int(df["Is Completed"].sum())
+    else:
+        actionable_mask = pd.Series(True, index=df.index)
+        committed_sp = df["Story Points"].sum()
+        delivered_sp = df[df["Is Completed"]]["Story Points"].sum()
+        done_issues = int(df["Is Completed"].sum())
     carryover_sp = committed_sp - delivered_sp
     completion_pct = round(float(delivered_sp) / float(committed_sp) * 100, 1) if committed_sp > 0 else 0.0
     total_issues = len(df)
-    done_issues = int(df["Is Completed"].sum())
     carryover_issues = total_issues - done_issues
     devs = sorted(df["Developer"].dropna().unique())
     active_devs = sum(1 for d in devs if d != "(Unassigned)")
@@ -583,22 +594,35 @@ def compute_sprint_metrics(df: pd.DataFrame):
     dev_rows = []
     for dev in devs:
         ddf = df[df["Developer"] == dev]
-        committed = float(ddf["Story Points"].sum())
-        delivered = float(ddf[ddf["Is Completed"]]["Story Points"].sum())
+        if has_commitment:
+            dev_summary = _commitment_summary(ddf)
+            dev_actionable_mask = ddf["Commitment Bucket"].isin(ACTIONABLE_COMMITMENT_BUCKETS)
+            committed = dev_summary["actionable_sp"]
+            delivered = float(ddf[dev_actionable_mask & ddf["Is Completed"]]["Story Points"].sum())
+            done_issue_count = int(ddf["Is Completed"].sum())
+            total_issue_count = len(ddf)
+        else:
+            committed = float(ddf["Story Points"].sum())
+            delivered = float(ddf[ddf["Is Completed"]]["Story Points"].sum())
+            done_issue_count = int(ddf["Is Completed"].sum())
+            total_issue_count = len(ddf)
         cp = round(delivered / committed * 100, 1) if committed > 0 else 0.0
         row = {
             "Developer": dev,
             "Committed SP": round(committed, 1),
             "Delivered SP": round(delivered, 1),
             "Completion %": cp,
-            "Total Issues": len(ddf),
-            "Done Issues": int(ddf["Is Completed"].sum()),
+            "Total Issues": total_issue_count,
+            "Done Issues": done_issue_count,
         }
         if has_origin:
             fresh = float(ddf[ddf["Origin"] == "New"]["Story Points"].sum())
             cf = float(ddf[ddf["Origin"] == "Carry-forward"]["Story Points"].sum())
             row["Fresh SP"] = round(fresh, 1)
             row["Carry-forward SP"] = round(cf, 1)
+        if has_commitment:
+            row["CF Dev SP"] = dev_summary["cf_dev_sp"]
+            row["CF Test SP"] = dev_summary["cf_test_sp"]
         dev_rows.append(row)
     dev_df = pd.DataFrame(dev_rows).sort_values("Committed SP", ascending=False).reset_index(drop=True)
     team = {
@@ -628,7 +652,7 @@ def compute_planning_metrics(df: pd.DataFrame):
     empty_dev = pd.DataFrame(columns=base_cols)
     empty_team = {
         "committed_sp": 0.0, "committed_count": 0,
-        "total_issues": 0, "active_devs": 0, "avg_sp_per_dev": 0.0,
+        "total_issues": 0, "active_devs": 0, "remaining_available_sp": 0.0,
         "fresh_count": 0, "fresh_sp": 0.0,
         "cf_dev_count": 0, "cf_dev_sp": 0.0,
         "cf_test_count": 0, "cf_test_sp": 0.0,
@@ -649,11 +673,8 @@ def compute_planning_metrics(df: pd.DataFrame):
     else:
         actionable_mask = pd.Series(True, index=df.index)
 
-    actionable_df = df[actionable_mask]
-    active_devs = sum(
-        1 for d in actionable_df["Developer"].dropna().unique() if d != "(Unassigned)"
-    )
-    avg_sp = round(committed_sp / active_devs, 1) if active_devs > 0 else 0.0
+    devs = sorted(df["Developer"].dropna().unique())
+    active_devs = sum(1 for d in devs if d != "(Unassigned)")
 
     unestimated_mask = actionable_mask & (df["Story Points"] == 0)
     unassigned_mask = actionable_mask & (df["Developer"] == "(Unassigned)")
@@ -667,7 +688,7 @@ def compute_planning_metrics(df: pd.DataFrame):
         "committed_count": summary["actionable_count"],
         "total_issues": total_issues,
         "active_devs": active_devs,
-        "avg_sp_per_dev": avg_sp,
+        "remaining_available_sp": 0.0,
         "fresh_count": summary["fresh_count"],
         "fresh_sp": summary["fresh_sp"],
         "cf_dev_count": summary["cf_dev_count"],
@@ -680,7 +701,6 @@ def compute_planning_metrics(df: pd.DataFrame):
         "unassigned_sp": unassigned_sp,
     }
 
-    devs = sorted(df["Developer"].dropna().unique())
     dev_rows = []
     for dev in devs:
         if dev == "(Unassigned)":
@@ -708,6 +728,7 @@ def compute_planning_metrics(df: pd.DataFrame):
         ["Committed SP", "Fresh SP", "CF Dev SP", "CF Test SP"],
         ascending=False,
     ).reset_index(drop=True)
+    team["remaining_available_sp"] = round(float(planning_dev["Balance SP"].sum()), 1)
     return team, planning_dev
 
 
@@ -843,21 +864,25 @@ button[data-testid="stTab"][aria-selected="true"] {
 
 /* ── Clickable developer-row overlay (table rows in render_dev_table) ── */
 [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"][class*="st-key-btn_dev_row_"]),
-[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"][class*="st-key-plan_drill_"]) {
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"][class*="st-key-plan_drill_"]),
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"][class*="st-key-exec_drill_"]) {
     position: relative !important;
     gap: 0 !important;
     margin-top: -1rem !important;
 }
 [data-testid="stElementContainer"][class*="st-key-btn_dev_row_"],
-[data-testid="stElementContainer"][class*="st-key-plan_drill_"] {
+[data-testid="stElementContainer"][class*="st-key-plan_drill_"],
+[data-testid="stElementContainer"][class*="st-key-exec_drill_"] {
     position: absolute !important; inset: 0 !important;
     z-index: 10 !important; margin: 0 !important; padding: 0 !important;
     pointer-events: none !important;
 }
 [class*="st-key-btn_dev_row_"] > div,
-[class*="st-key-plan_drill_"] > div { height: 100% !important; margin: 0 !important; }
+[class*="st-key-plan_drill_"] > div,
+[class*="st-key-exec_drill_"] > div { height: 100% !important; margin: 0 !important; }
 [class*="st-key-btn_dev_row_"] > div > button,
-[class*="st-key-plan_drill_"] > div > button {
+[class*="st-key-plan_drill_"] > div > button,
+[class*="st-key-exec_drill_"] > div > button {
     height: 100% !important; width: 100% !important;
     min-height: 0 !important;
     background: transparent !important; border: none !important;
@@ -870,7 +895,10 @@ button[data-testid="stTab"][aria-selected="true"] {
 [class*="st-key-btn_dev_row_"] > div > button:active,
 [class*="st-key-plan_drill_"] > div > button:hover,
 [class*="st-key-plan_drill_"] > div > button:focus,
-[class*="st-key-plan_drill_"] > div > button:active {
+[class*="st-key-plan_drill_"] > div > button:active,
+[class*="st-key-exec_drill_"] > div > button:hover,
+[class*="st-key-exec_drill_"] > div > button:focus,
+[class*="st-key-exec_drill_"] > div > button:active {
     background: transparent !important; box-shadow: none !important; outline: none !important;
 }
 
@@ -1449,7 +1477,7 @@ def _show_dev_drilldown_dialog(
 
 @st.dialog("Sprint Task Drill-Down", width="large")
 def _show_sprint_dev_dialog(dev: str, sprint_name: str, dev_issues_df: pd.DataFrame,
-                             jira_domain: str):
+                             jira_domain: str, view_context: str = "Planning"):
     """Single-developer sprint task list — no historical chart, just commitment."""
     st.markdown(
         f"<div style='font-size:13px;color:#64748b;margin:-6px 0 14px 0'>"
@@ -1463,22 +1491,37 @@ def _show_sprint_dev_dialog(dev: str, sprint_name: str, dev_issues_df: pd.DataFr
         st.info("No issues assigned to this developer in this sprint.")
         return
 
+    is_execution = view_context == "Execution"
     dev_summary = _commitment_summary(dev_issues_df)
-    committed_sp = dev_summary["actionable_sp"]
+    has_commitment = "Commitment Bucket" in dev_issues_df.columns
+    committed_sp = dev_summary["actionable_sp"] if has_commitment else float(dev_issues_df["Story Points"].sum())
     n_issues = len(dev_issues_df)
-    util_label = _utilization_label(committed_sp)
-    issue_sublabel = "Assigned to dev"
-    if dev_summary["cf_test_count"] > 0:
-        issue_sublabel = (
-            f"{_issue_count_text(dev_summary['cf_test_count'])} in TEST carry-forward"
-        )
+    if has_commitment:
+        actionable_mask = dev_issues_df["Commitment Bucket"].isin(ACTIONABLE_COMMITMENT_BUCKETS)
+    else:
+        actionable_mask = pd.Series(True, index=dev_issues_df.index)
+    delivered_sp = float(dev_issues_df[actionable_mask & dev_issues_df["Is Completed"]]["Story Points"].sum())
+    completion_pct = round(delivered_sp / committed_sp * 100, 1) if committed_sp > 0 else 0.0
 
     kpi_cols = st.columns(3)
-    kpi_cfg = [
-        ("Committed SP", f"{committed_sp:.1f}", "Fresh + dev CF",      "#6366f1"),
-        ("Issues",       str(n_issues),         issue_sublabel,        "#8b5cf6"),
-        ("Utilization",  util_label,            f"Target {SPRINT_MIN_SP_PER_DEV}–{SPRINT_MAX_SP_PER_DEV} SP", "#06b6d4"),
-    ]
+    if is_execution:
+        kpi_cfg = [
+            ("Committed SP", f"{committed_sp:.1f}", "Fresh + dev CF",              "#6366f1"),
+            ("Delivered SP", f"{delivered_sp:.1f}", "Accepted or closed",          "#22c55e"),
+            ("Completion",   f"{completion_pct:.1f}%", f"{n_issues} assigned issues", "#06b6d4"),
+        ]
+    else:
+        util_label = _utilization_label(committed_sp)
+        issue_sublabel = "Assigned to dev"
+        if dev_summary["cf_test_count"] > 0:
+            issue_sublabel = (
+                f"{_issue_count_text(dev_summary['cf_test_count'])} in TEST carry-forward"
+            )
+        kpi_cfg = [
+            ("Committed SP", f"{committed_sp:.1f}", "Fresh + dev CF",      "#6366f1"),
+            ("Issues",       str(n_issues),         issue_sublabel,        "#8b5cf6"),
+            ("Utilization",  util_label,            f"Target {SPRINT_MIN_SP_PER_DEV}–{SPRINT_MAX_SP_PER_DEV} SP", "#06b6d4"),
+        ]
     for col, (label, value, sublabel, accent) in zip(kpi_cols, kpi_cfg):
         with col:
             st.markdown(f"""
@@ -1644,12 +1687,12 @@ def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
     )
 
     kpi_cfg = [
+        ("Capacity Devs", str(team['active_devs']),
+            "Developers in capacity table",                                             "#8b5cf6", "DEV"),
         ("Committed SP",  f"{team['committed_sp']:.1f}",
             commitment_split,                                                         "#6366f1", "SP"),
-        ("Capacity Devs", str(team['active_devs']),
-            "With actionable work",                                                    "#8b5cf6", "DEV"),
-        ("Avg SP / Dev",  f"{team['avg_sp_per_dev']:.1f}",
-            f"Target {SPRINT_MIN_SP_PER_DEV}–{SPRINT_MAX_SP_PER_DEV}",                 "#06b6d4", "μ"),
+        ("Remaining Capacity", f"{team['remaining_available_sp']:.1f}",
+            f"Against {SPRINT_EXPECTED_SP_PER_DEV} SP expected/dev",                   "#16a34a", "SP"),
         ("Unestimated",   str(team['unestimated_count']),
             f"{_issue_count_text(team['unestimated_count'])} missing SP",
             "#f59e0b", "?"),
@@ -1772,8 +1815,20 @@ def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
                     r["Developer"], sprint_name, dev_issues, jira_domain,
                 )
 
+    st.markdown(f"""
+<div style="background:#f8fafc;border:1px solid #cbd5e1;border-left:4px solid #6366f1;
+            border-radius:10px;padding:14px 16px;margin:16px 0 4px;color:#334155">
+  <div style="font-size:13px;font-weight:700;color:#0f172a;margin-bottom:8px">Planning notes</div>
+  <ul style="font-size:13px;line-height:1.65;margin:0;padding-left:18px">
+    <li><b>Fresh SP</b> is newly added sprint work; <b>CF Dev</b> is carry-forward still counted as developer capacity.</li>
+    <li><b>CF Test</b> is carry-forward currently in <b>TEST</b>; it remains visible for ownership but is excluded from committed developer capacity.</li>
+    <li>Sprint commitment is <b>Fresh SP + CF Dev SP</b>; Balance SP is <b>max({SPRINT_EXPECTED_SP_PER_DEV} - committed SP, 0)</b> per developer.</li>
+    <li>Healthy utilization remains <b>{SPRINT_MIN_SP_PER_DEV}-{SPRINT_MAX_SP_PER_DEV} SP</b>; Capacity Devs counts every assigned developer in the table.</li>
+  </ul>
+</div>""", unsafe_allow_html=True)
 
-def render_sprint_execution_section(issues_df: pd.DataFrame, prev_sprint,
+
+def render_sprint_execution_section(issues_df: pd.DataFrame, sprint_name: str, prev_sprint,
                                      prev_sprint_name, cf_count: int, fresh_count: int,
                                      fresh_sp: float,
                                      jira_domain: str, divider_html: str):
@@ -1782,8 +1837,13 @@ def render_sprint_execution_section(issues_df: pd.DataFrame, prev_sprint,
 
     _section_header("Sprint Metrics", f"{team['total_issues']} issues · {team['active_devs']} developers")
     kpi_cols = st.columns(5)
+    commitment_split = (
+        f"Fresh: {commitment_summary['fresh_sp']:.1f} SP · "
+        f"Dev CF: {commitment_summary['cf_dev_sp']:.1f} SP · "
+        f"Test CF: {commitment_summary['cf_test_sp']:.1f} SP"
+    )
     kpi_cfg = [
-        ("Committed SP",  f"{team['committed_sp']:.1f}", "Total SP in sprint",        "#6366f1", "SP"),
+        ("Committed SP",  f"{team['committed_sp']:.1f}", commitment_split,        "#6366f1", "SP"),
         ("Delivered SP",  f"{team['delivered_sp']:.1f}", f"{team['done_issues']} issues done", "#22c55e", "✓"),
         ("Completion %",  f"{team['completion_pct']:.1f}%", "Delivered / Committed",  "#06b6d4", "%"),
         ("Pending SP",    f"{team['carryover_sp']:.1f}", f"{team['carryover_issues']} issues not done", "#f59e0b", "→"),
@@ -1835,65 +1895,100 @@ def render_sprint_execution_section(issues_df: pd.DataFrame, prev_sprint,
 
     show_origin_split = bool(prev_sprint) and cf_count > 0 and "Fresh SP" in dev_df.columns
     breakdown_subtitle = (
-        "Fresh vs Carry-forward · Planned vs Delivered per developer"
+        "Committed = Fresh + CF Dev · Carry-forward shows Dev + Test split"
         if show_origin_split else "Planned vs Delivered per developer"
     )
     _section_header("Developer Breakdown", breakdown_subtitle)
     if not dev_df.empty:
-        th2 = "padding:10px 14px;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.07em;text-align:left;border-bottom:1px solid #e2e8f0"
-        td2 = "padding:12px 14px;font-size:13px;color:#334155;border-bottom:1px solid #f1f5f9;vertical-align:middle"
-        dev_rows = ""
+        th2 = ("padding:14px 16px;font-size:12px;font-weight:600;color:#64748b;"
+               "text-transform:uppercase;letter-spacing:.07em;text-align:left;"
+               "white-space:nowrap;background:#f8fafc;border:1px solid #e2e8f0")
+        td2 = ("padding:16px 18px;font-size:15px;color:#334155;vertical-align:middle;"
+               "border:1px solid #e2e8f0;border-top:0")
+
+        col_widths = [24, 14, 14, 25, 13]
+        if show_origin_split:
+            col_widths = [18, 11, 11, 19, 10, 10, 10, 11]
+        total = sum(col_widths)
+        col_widths = [round(w / total * 100, 1) for w in col_widths]
+        colgroup = "<colgroup>" + "".join(f'<col style="width:{w}%">' for w in col_widths) + "</colgroup>"
+
+        origin_headers = ""
+        if show_origin_split:
+            origin_headers = (
+                f'<th style="{th2};text-align:center">Fresh SP</th>'
+                f'<th style="{th2};text-align:center">CF Dev SP</th>'
+                f'<th style="{th2};text-align:center">CF Test SP</th>'
+            )
+
+        st.markdown(f"""
+<div class="dev-table-wrap" style="border-radius:12px 12px 0 0;overflow:hidden;
+            box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <table style="width:100%;border-collapse:collapse;table-layout:fixed">
+    {colgroup}
+    <thead>
+      <tr style="background:#f8fafc">
+        <th style="{th2}">Developer</th>
+        <th style="{th2};text-align:center">Committed SP</th>
+        <th style="{th2};text-align:center">Delivered SP</th>
+        <th style="{th2}">Completion</th>
+        <th style="{th2};text-align:center">Issues Done</th>
+        {origin_headers}
+      </tr>
+    </thead>
+  </table>
+</div>""", unsafe_allow_html=True)
+
+        n = len(dev_df)
+        issues_by_dev = {dev: ddf for dev, ddf in issues_df.groupby("Developer")}
         for i, (_, r) in enumerate(dev_df.iterrows()):
             bg = "#f8fafc" if i % 2 == 0 else "#ffffff"
+            is_last = (i == n - 1)
+            radius = "0 0 12px 12px" if is_last else "0"
             cp = r["Completion %"]
             bar_clr = "#16a34a" if cp >= 80 else ("#d97706" if cp >= 60 else "#dc2626")
             bar_w = min(float(cp), 100)
             progress = (
                 f'<div style="display:flex;align-items:center;gap:6px;min-width:130px">'
-                f'<div style="flex:1;background:#e2e8f0;border-radius:4px;height:5px">'
-                f'<div style="width:{bar_w:.0f}%;background:{bar_clr};height:5px;border-radius:4px"></div>'
+                f'<div style="flex:1;background:#e2e8f0;border-radius:4px;height:6px">'
+                f'<div style="width:{bar_w:.0f}%;background:{bar_clr};height:6px;border-radius:4px"></div>'
                 f'</div>'
-                f'<span style="font-size:12px;font-weight:600;color:#0f172a;min-width:40px;text-align:right">{cp:.1f}%</span>'
+                f'<span style="font-size:13px;font-weight:600;color:#0f172a;min-width:44px;text-align:right">{cp:.1f}%</span>'
                 f'</div>'
             )
             origin_cells = ""
             if show_origin_split:
+                cf_dev = float(r.get("CF Dev SP", 0))
+                cf_test = float(r.get("CF Test SP", 0))
                 origin_cells = (
                     f'<td style="{td2};text-align:center;font-weight:600;color:#6366f1">{r["Fresh SP"]:.1f}</td>'
-                    f'<td style="{td2};text-align:center;font-weight:600;color:#f59e0b">{r["Carry-forward SP"]:.1f}</td>'
+                    f'<td style="{td2};text-align:center;font-weight:600;color:#f59e0b">{cf_dev:.1f}</td>'
+                    f'<td style="{td2};text-align:center;font-weight:600;color:#0891b2">{cf_test:.1f}</td>'
                 )
-            dev_rows += (
-                f'<tr style="background:{bg}">'
-                f'<td style="{td2};font-weight:600;color:#0f172a">{_html.escape(str(r["Developer"]))}</td>'
-                f'{origin_cells}'
-                f'<td style="{td2};text-align:center;font-weight:700;font-size:15px;color:#6366f1">{r["Committed SP"]:.1f}</td>'
-                f'<td style="{td2};text-align:center;font-weight:700;font-size:15px;color:#22c55e">{r["Delivered SP"]:.1f}</td>'
-                f'<td style="{td2}">{progress}</td>'
-                f'<td style="{td2};text-align:center;color:#64748b">{int(r["Done Issues"])}/{int(r["Total Issues"])}</td>'
-                f'</tr>'
-            )
-        origin_headers = (
-            f'<th style="{th2};text-align:center">Fresh SP</th>'
-            f'<th style="{th2};text-align:center">Carry-forward SP</th>'
-        ) if show_origin_split else ""
-        st.markdown(f"""
-<div style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;
-            overflow:hidden;overflow-x:auto;box-shadow:0 1px 4px rgba(0,0,0,.06);margin-bottom:20px">
-  <table style="width:100%;border-collapse:collapse">
-    <thead>
-      <tr style="background:#f8fafc">
-        <th style="{th2}">Developer</th>
-        {origin_headers}
-        <th style="{th2};text-align:center">Committed SP</th>
-        <th style="{th2};text-align:center">Delivered SP</th>
-        <th style="{th2}">Completion</th>
-        <th style="{th2};text-align:center">Issues Done</th>
+            with st.container():
+                st.markdown(f"""
+<div class="dev-table-wrap" style="border-radius:{radius};overflow:hidden;
+            box-shadow:0 1px 4px rgba(0,0,0,.06)">
+  <table style="width:100%;border-collapse:collapse;table-layout:fixed;background:{bg}">
+    {colgroup}
+    <tbody>
+      <tr>
+        <td style="{td2};font-weight:600;color:#0f172a">{_html.escape(str(r["Developer"]))}</td>
+        <td style="{td2};text-align:center;font-weight:700;font-size:17px;color:#6366f1">{r["Committed SP"]:.1f}</td>
+        <td style="{td2};text-align:center;font-weight:700;font-size:17px;color:#22c55e">{r["Delivered SP"]:.1f}</td>
+        <td style="{td2}">{progress}</td>
+        <td style="{td2};text-align:center;color:#64748b">{int(r["Done Issues"])}/{int(r["Total Issues"])}</td>
+        {origin_cells}
       </tr>
-    </thead>
-    <tbody>{dev_rows}</tbody>
+    </tbody>
   </table>
-</div>
-""", unsafe_allow_html=True)
+</div>""", unsafe_allow_html=True)
+                if st.button(" ", key=f"exec_drill_{i}", use_container_width=True):
+                    dev_issues = issues_by_dev.get(r["Developer"], pd.DataFrame())
+                    _show_sprint_dev_dialog(
+                        r["Developer"], sprint_name, dev_issues, jira_domain,
+                        view_context="Execution",
+                    )
 
     st.markdown(divider_html, unsafe_allow_html=True)
 
@@ -2104,9 +2199,8 @@ def render_sprint_view(jira_config: dict):
             committed_sp_total = float(issues_df["Story Points"].sum())
             hero_sp_label = "SP in sprint"
         else:
-            actionable_df = issues_df[issues_df["Is Actionable Commitment"]]
             active_devs_count = sum(
-                1 for d in actionable_df["Developer"].dropna().unique() if d != "(Unassigned)"
+                1 for d in issues_df["Developer"].dropna().unique() if d != "(Unassigned)"
             )
             committed_sp_total = commitment_summary["actionable_sp"]
             hero_sp_label = "SP committed"
@@ -2176,7 +2270,7 @@ def render_sprint_view(jira_config: dict):
         )
     else:
         render_sprint_execution_section(
-            issues_df, prev_sprint, prev_sprint_name,
+            issues_df, sprint_name, prev_sprint, prev_sprint_name,
             cf_count, fresh_count, fresh_sp, jira_domain, DIVIDER,
         )
 
