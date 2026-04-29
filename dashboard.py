@@ -40,6 +40,12 @@ DEV_DAY_RATIO = SPRINT_DEV_DAYS / SPRINT_WORKING_DAYS   # 0.7
 # Sprint status grouping — case-insensitive comparison (Jira returns title-case)
 SPRINT_DONE_STATUSES = {"ACCEPTED IN QA", "CLOSED"}
 SPRINT_IN_PROGRESS_STATUSES = {"IN PROGRESS", "TEST", "DESIGN", "REVIEW", "IN REVIEW", "STAGING", "QA", "REOPENED"}
+SPRINT_TEST_MODE_STATUSES = {"TEST"}
+
+COMMITMENT_FRESH = "Fresh Commitment"
+COMMITMENT_CF_DEV = "Carry-forward Dev"
+COMMITMENT_CF_TEST = "Carry-forward Test"
+ACTIONABLE_COMMITMENT_BUCKETS = {COMMITMENT_FRESH, COMMITMENT_CF_DEV}
 
 # Sprint planning capacity thresholds (per developer, per 2-week sprint)
 SPRINT_MIN_SP_PER_DEV = 7
@@ -470,6 +476,84 @@ def compute_metrics(df: pd.DataFrame, bugs_df: pd.DataFrame, start_date: date, e
     return team_metrics, dev_df
 
 
+def _commitment_bucket_for_issue(key: str, status: str, carry_forward_keys: set) -> str:
+    if key not in carry_forward_keys:
+        return COMMITMENT_FRESH
+    if str(status or "").strip().upper() in SPRINT_TEST_MODE_STATUSES:
+        return COMMITMENT_CF_TEST
+    return COMMITMENT_CF_DEV
+
+
+def add_commitment_classification(df: pd.DataFrame, carry_forward_keys: set) -> pd.DataFrame:
+    """Classify sprint issues for planning capacity without mutating raw Jira rows."""
+    result = df.copy()
+    carry_forward_keys = set(carry_forward_keys or [])
+    if result.empty:
+        result["Origin"] = pd.Series(dtype="object")
+        result["Commitment Bucket"] = pd.Series(dtype="object")
+        result["Is Actionable Commitment"] = pd.Series(dtype=bool)
+        return result
+
+    result["Origin"] = result["Key"].apply(
+        lambda k: "Carry-forward" if k in carry_forward_keys else "New"
+    )
+    result["Commitment Bucket"] = result.apply(
+        lambda r: _commitment_bucket_for_issue(
+            r.get("Key", ""), r.get("Status", ""), carry_forward_keys
+        ),
+        axis=1,
+    )
+    result["Is Actionable Commitment"] = result["Commitment Bucket"].isin(
+        ACTIONABLE_COMMITMENT_BUCKETS
+    )
+    return result
+
+
+def _commitment_summary(df: pd.DataFrame) -> dict:
+    if df.empty:
+        return {
+            "fresh_count": 0, "fresh_sp": 0.0,
+            "cf_dev_count": 0, "cf_dev_sp": 0.0,
+            "cf_test_count": 0, "cf_test_sp": 0.0,
+            "cf_count": 0, "cf_sp": 0.0,
+            "actionable_count": 0, "actionable_sp": 0.0,
+        }
+
+    if "Commitment Bucket" in df.columns:
+        bucket = df["Commitment Bucket"]
+    elif "Origin" in df.columns:
+        bucket = df["Origin"].map({
+            "Carry-forward": COMMITMENT_CF_DEV,
+            "New": COMMITMENT_FRESH,
+        }).fillna(COMMITMENT_FRESH)
+    else:
+        bucket = pd.Series(COMMITMENT_FRESH, index=df.index)
+
+    fresh_mask = bucket == COMMITMENT_FRESH
+    cf_dev_mask = bucket == COMMITMENT_CF_DEV
+    cf_test_mask = bucket == COMMITMENT_CF_TEST
+    actionable_mask = bucket.isin(ACTIONABLE_COMMITMENT_BUCKETS)
+
+    fresh_sp = round(float(df.loc[fresh_mask, "Story Points"].sum()), 1)
+    cf_dev_sp = round(float(df.loc[cf_dev_mask, "Story Points"].sum()), 1)
+    cf_test_sp = round(float(df.loc[cf_test_mask, "Story Points"].sum()), 1)
+    cf_count = int(cf_dev_mask.sum() + cf_test_mask.sum())
+    cf_sp = round(cf_dev_sp + cf_test_sp, 1)
+
+    return {
+        "fresh_count": int(fresh_mask.sum()),
+        "fresh_sp": fresh_sp,
+        "cf_dev_count": int(cf_dev_mask.sum()),
+        "cf_dev_sp": cf_dev_sp,
+        "cf_test_count": int(cf_test_mask.sum()),
+        "cf_test_sp": cf_test_sp,
+        "cf_count": cf_count,
+        "cf_sp": cf_sp,
+        "actionable_count": int(actionable_mask.sum()),
+        "actionable_sp": round(fresh_sp + cf_dev_sp, 1),
+    }
+
+
 def compute_sprint_metrics(df: pd.DataFrame):
     """Returns (team_dict, dev_df) for a sprint issues DataFrame."""
     has_origin = "Origin" in df.columns
@@ -533,32 +617,45 @@ def compute_sprint_metrics(df: pd.DataFrame):
 def compute_planning_metrics(df: pd.DataFrame):
     """Returns (team_dict, dev_df) for the Planning lens.
 
-    Team dict surfaces commitment + readiness gaps (unestimated/unassigned).
-    Dev_df keeps only fields meaningful pre-execution (no Delivered/Completion %)
-    and adds a Utilization label per developer.
+    Planning commitment excludes carry-forward already in TEST, because that work
+    is waiting on QE rather than consuming developer capacity.
     """
-    has_origin = "Origin" in df.columns
-    base_cols = ["Developer", "Committed SP", "Total Issues"]
-    if has_origin:
-        base_cols += ["Fresh SP", "Carry-forward SP"]
-    base_cols += ["Utilization"]
+    base_cols = [
+        "Developer", "Committed SP", "Total Issues",
+        "Fresh SP", "CF Dev SP", "CF Test SP", "Utilization",
+    ]
     empty_dev = pd.DataFrame(columns=base_cols)
     empty_team = {
-        "committed_sp": 0.0, "total_issues": 0, "active_devs": 0, "avg_sp_per_dev": 0.0,
+        "committed_sp": 0.0, "committed_count": 0,
+        "total_issues": 0, "active_devs": 0, "avg_sp_per_dev": 0.0,
+        "fresh_count": 0, "fresh_sp": 0.0,
+        "cf_dev_count": 0, "cf_dev_sp": 0.0,
+        "cf_test_count": 0, "cf_test_sp": 0.0,
         "unestimated_count": 0, "unestimated_sp": 0.0,
         "unassigned_count": 0, "unassigned_sp": 0.0,
     }
     if df.empty:
         return empty_team, empty_dev
 
-    base_team, base_dev = compute_sprint_metrics(df)
-    committed_sp = base_team["committed_sp"]
-    total_issues = base_team["total_issues"]
-    active_devs = base_team["active_devs"]
+    summary = _commitment_summary(df)
+    committed_sp = summary["actionable_sp"]
+    total_issues = len(df)
+
+    if "Is Actionable Commitment" in df.columns:
+        actionable_mask = df["Is Actionable Commitment"].fillna(False)
+    elif "Commitment Bucket" in df.columns:
+        actionable_mask = df["Commitment Bucket"].isin(ACTIONABLE_COMMITMENT_BUCKETS)
+    else:
+        actionable_mask = pd.Series(True, index=df.index)
+
+    actionable_df = df[actionable_mask]
+    active_devs = sum(
+        1 for d in actionable_df["Developer"].dropna().unique() if d != "(Unassigned)"
+    )
     avg_sp = round(committed_sp / active_devs, 1) if active_devs > 0 else 0.0
 
-    unestimated_mask = df["Story Points"] == 0
-    unassigned_mask = df["Developer"] == "(Unassigned)"
+    unestimated_mask = actionable_mask & (df["Story Points"] == 0)
+    unassigned_mask = actionable_mask & (df["Developer"] == "(Unassigned)")
     unestimated_count = int(unestimated_mask.sum())
     unestimated_sp = round(float(df.loc[unestimated_mask, "Story Points"].sum()), 1)
     unassigned_count = int(unassigned_mask.sum())
@@ -566,28 +663,48 @@ def compute_planning_metrics(df: pd.DataFrame):
 
     team = {
         "committed_sp": committed_sp,
+        "committed_count": summary["actionable_count"],
         "total_issues": total_issues,
         "active_devs": active_devs,
         "avg_sp_per_dev": avg_sp,
+        "fresh_count": summary["fresh_count"],
+        "fresh_sp": summary["fresh_sp"],
+        "cf_dev_count": summary["cf_dev_count"],
+        "cf_dev_sp": summary["cf_dev_sp"],
+        "cf_test_count": summary["cf_test_count"],
+        "cf_test_sp": summary["cf_test_sp"],
         "unestimated_count": unestimated_count,
         "unestimated_sp": unestimated_sp,
         "unassigned_count": unassigned_count,
         "unassigned_sp": unassigned_sp,
     }
 
-    if base_dev.empty:
+    devs = sorted(df["Developer"].dropna().unique())
+    dev_rows = []
+    for dev in devs:
+        if dev == "(Unassigned)":
+            continue
+
+        ddf = df[df["Developer"] == dev]
+        dev_summary = _commitment_summary(ddf)
+        committed = dev_summary["actionable_sp"]
+        dev_rows.append({
+            "Developer": dev,
+            "Committed SP": committed,
+            "Total Issues": len(ddf),
+            "Fresh SP": dev_summary["fresh_sp"],
+            "CF Dev SP": dev_summary["cf_dev_sp"],
+            "CF Test SP": dev_summary["cf_test_sp"],
+            "Utilization": _utilization_label(committed),
+        })
+
+    if not dev_rows:
         return team, empty_dev
 
-    planning_dev = base_dev[base_dev["Developer"] != "(Unassigned)"].copy()
-    if planning_dev.empty:
-        return team, empty_dev
-
-    planning_dev["Utilization"] = planning_dev["Committed SP"].apply(_utilization_label)
-    keep_cols = ["Developer", "Committed SP", "Total Issues"]
-    if has_origin and "Fresh SP" in planning_dev.columns:
-        keep_cols += ["Fresh SP", "Carry-forward SP"]
-    keep_cols += ["Utilization"]
-    planning_dev = planning_dev[keep_cols].reset_index(drop=True)
+    planning_dev = pd.DataFrame(dev_rows).sort_values(
+        ["Committed SP", "Fresh SP", "CF Dev SP", "CF Test SP"],
+        ascending=False,
+    ).reset_index(drop=True)
     return team, planning_dev
 
 
@@ -917,6 +1034,18 @@ def _origin_badge(o):
     return '<span style="background:#eff6ff;color:#1d4ed8;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">New</span>'
 
 
+def _commitment_badge(bucket):
+    if bucket == COMMITMENT_CF_TEST:
+        return '<span style="background:#ecfeff;color:#0891b2;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">CF Test</span>'
+    if bucket == COMMITMENT_CF_DEV:
+        return '<span style="background:#fff7ed;color:#c2410c;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">CF Dev</span>'
+    return '<span style="background:#eff6ff;color:#1d4ed8;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">Fresh</span>'
+
+
+def _issue_count_text(count: int) -> str:
+    return f"{count} issue{'s' if count != 1 else ''}"
+
+
 def _utilization_badge(util_label, sp):
     palette = {
         "Under": ("#fee2e2", "#dc2626"),
@@ -931,8 +1060,8 @@ def _utilization_badge(util_label, sp):
     else:
         body = f"{sp:.1f} SP"
     return (
-        f'<span style="background:{bg};color:{fg};padding:3px 10px;border-radius:12px;'
-        f'font-size:11px;font-weight:700">{util_label.upper()} · {body}</span>'
+        f'<span style="background:{bg};color:{fg};padding:5px 12px;border-radius:12px;'
+        f'font-size:12px;font-weight:700">{util_label.upper()} · {body}</span>'
     )
 
 
@@ -1331,14 +1460,20 @@ def _show_sprint_dev_dialog(dev: str, sprint_name: str, dev_issues_df: pd.DataFr
         st.info("No issues assigned to this developer in this sprint.")
         return
 
-    committed_sp = float(dev_issues_df["Story Points"].sum())
+    dev_summary = _commitment_summary(dev_issues_df)
+    committed_sp = dev_summary["actionable_sp"]
     n_issues = len(dev_issues_df)
     util_label = _utilization_label(committed_sp)
+    issue_sublabel = "Assigned to dev"
+    if dev_summary["cf_test_count"] > 0:
+        issue_sublabel = (
+            f"{_issue_count_text(dev_summary['cf_test_count'])} in TEST carry-forward"
+        )
 
     kpi_cols = st.columns(3)
     kpi_cfg = [
-        ("Committed SP", f"{committed_sp:.1f}", "This sprint",         "#6366f1"),
-        ("Issues",       str(n_issues),         "Assigned to dev",     "#8b5cf6"),
+        ("Committed SP", f"{committed_sp:.1f}", "Fresh + dev CF",      "#6366f1"),
+        ("Issues",       str(n_issues),         issue_sublabel,        "#8b5cf6"),
         ("Utilization",  util_label,            f"Target {SPRINT_MIN_SP_PER_DEV}–{SPRINT_MAX_SP_PER_DEV} SP", "#06b6d4"),
     ]
     for col, (label, value, sublabel, accent) in zip(kpi_cols, kpi_cfg):
@@ -1356,7 +1491,7 @@ def _show_sprint_dev_dialog(dev: str, sprint_name: str, dev_issues_df: pd.DataFr
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    show_origin = "Origin" in dev_issues_df.columns
+    show_commitment = "Commitment Bucket" in dev_issues_df.columns
     jira_base = f"https://{jira_domain}/browse/"
     th = "padding:8px 12px;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.07em;text-align:left;border-bottom:1px solid #e2e8f0;white-space:nowrap"
     td = "padding:10px 12px;font-size:13px;color:#334155;border-bottom:1px solid #f1f5f9;vertical-align:middle"
@@ -1369,8 +1504,10 @@ def _show_sprint_dev_dialog(dev: str, sprint_name: str, dev_issues_df: pd.DataFr
                 f'{_html.escape(r["Key"])}</a>')
         summ_full = str(r["Summary"])
         summ = _html.escape(summ_full[:90]) + ("…" if len(summ_full) > 90 else "")
-        origin_cell = (f'<td style="{td}">{_origin_badge(r["Origin"])}</td>'
-                       if show_origin else "")
+        commitment_cell = (
+            f'<td style="{td}">{_commitment_badge(r["Commitment Bucket"])}</td>'
+            if show_commitment else ""
+        )
         rows_html += (
             f'<tr>'
             f'<td style="{td};white-space:nowrap">{link}</td>'
@@ -1378,11 +1515,11 @@ def _show_sprint_dev_dialog(dev: str, sprint_name: str, dev_issues_df: pd.DataFr
             f'<td style="{td};white-space:nowrap">{_html.escape(r["Status"])}</td>'
             f'<td style="{td}">{_group_badge(r["Status Group"])}</td>'
             f'<td style="{td};text-align:center;font-weight:600;color:#4f46e5">{sp_str}</td>'
-            f'{origin_cell}'
+            f'{commitment_cell}'
             f'</tr>'
         )
 
-    origin_header = f'<th style="{th}">Origin</th>' if show_origin else ""
+    commitment_header = f'<th style="{th}">Commitment</th>' if show_commitment else ""
     st.markdown(f"""
 <div style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;
             overflow:hidden;overflow-x:auto;box-shadow:0 1px 4px rgba(0,0,0,.06)">
@@ -1394,7 +1531,7 @@ def _show_sprint_dev_dialog(dev: str, sprint_name: str, dev_issues_df: pd.DataFr
         <th style="{th}">Status</th>
         <th style="{th}">Group</th>
         <th style="{th};text-align:center">SP</th>
-        {origin_header}
+        {commitment_header}
       </tr>
     </thead>
     <tbody>{rows_html}</tbody>
@@ -1494,18 +1631,24 @@ def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
 
     _section_header(
         "Sprint Planning",
-        f"{team['total_issues']} issues · {team['active_devs']} developers assigned",
+        f"{team['committed_count']} developer-work issues · {team['active_devs']} capacity developers",
+    )
+
+    commitment_split = (
+        f"Fresh: {team['fresh_sp']:.1f} SP · "
+        f"Dev CF: {team['cf_dev_sp']:.1f} SP · "
+        f"Test CF: {team['cf_test_sp']:.1f} SP"
     )
 
     kpi_cfg = [
         ("Committed SP",  f"{team['committed_sp']:.1f}",
-            f"{team['total_issues']} issues",                                          "#6366f1", "SP"),
-        ("Devs Assigned", str(team['active_devs']),
-            "Excluding unassigned",                                                    "#8b5cf6", "DEV"),
+            commitment_split,                                                         "#6366f1", "SP"),
+        ("Capacity Devs", str(team['active_devs']),
+            "With actionable work",                                                    "#8b5cf6", "DEV"),
         ("Avg SP / Dev",  f"{team['avg_sp_per_dev']:.1f}",
             f"Target {SPRINT_MIN_SP_PER_DEV}–{SPRINT_MAX_SP_PER_DEV}",                 "#06b6d4", "μ"),
         ("Unestimated",   str(team['unestimated_count']),
-            f"{team['unestimated_count']} issue{'s' if team['unestimated_count'] != 1 else ''} missing SP",
+            f"{_issue_count_text(team['unestimated_count'])} missing SP",
             "#f59e0b", "?"),
         ("Unassigned",    str(team['unassigned_count']),
             f"{team['unassigned_sp']:.1f} SP without owner",                           "#ef4444", "⚠"),
@@ -1530,27 +1673,27 @@ def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
 
     st.markdown(divider_html, unsafe_allow_html=True)
 
-    show_origin_split = (prev_sprint is not None) and ("Fresh SP" in dev_df.columns)
+    show_commitment_split = "Fresh SP" in dev_df.columns
 
-    _section_header("Developer Capacity", "Capacity utilization per developer")
+    _section_header("Developer Capacity", "Fresh + dev carry-forward count toward utilization")
 
     if dev_df.empty:
         st.markdown("""
 <div style="background:#fff7ed;border:1px solid #fdba74;border-radius:10px;padding:18px;
             text-align:center;color:#9a3412;font-weight:500;margin-bottom:20px">
-  All committed issues are unassigned. Assign developers in Jira to see capacity utilization.
+  No developer-owned actionable commitments found. Assign developers in Jira to see capacity utilization.
 </div>""", unsafe_allow_html=True)
         return
 
-    th2 = ("padding:12px 14px;font-size:11px;font-weight:600;color:#64748b;"
+    th2 = ("padding:14px 16px;font-size:12px;font-weight:600;color:#64748b;"
            "text-transform:uppercase;letter-spacing:.07em;text-align:left;"
            "white-space:nowrap;background:#f8fafc;border:1px solid #e2e8f0")
-    td2 = ("padding:14px 16px;font-size:13px;color:#334155;vertical-align:middle;"
+    td2 = ("padding:16px 18px;font-size:15px;color:#334155;vertical-align:middle;"
            "border:1px solid #e2e8f0;border-top:0")
 
-    col_widths = [22, 13, 11]
-    if show_origin_split:
-        col_widths += [12, 14]
+    col_widths = [20, 12, 10]
+    if show_commitment_split:
+        col_widths += [11, 11, 11]
     col_widths += [15]
     total = sum(col_widths)
     col_widths = [round(w / total * 100, 1) for w in col_widths]
@@ -1559,9 +1702,10 @@ def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
     headers_html = f'<th style="{th2}">Developer</th>'
     headers_html += f'<th style="{th2};text-align:center">Committed SP</th>'
     headers_html += f'<th style="{th2};text-align:center"># Issues</th>'
-    if show_origin_split:
+    if show_commitment_split:
         headers_html += f'<th style="{th2};text-align:center">Fresh SP</th>'
-        headers_html += f'<th style="{th2};text-align:center">Carry-forward</th>'
+        headers_html += f'<th style="{th2};text-align:center">CF Dev</th>'
+        headers_html += f'<th style="{th2};text-align:center">CF Test</th>'
     headers_html += f'<th style="{th2};text-align:center">Utilization</th>'
 
     st.markdown(f"""
@@ -1588,13 +1732,15 @@ def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
         committed = float(r["Committed SP"])
         util_cell = _utilization_badge(r["Utilization"], committed)
 
-        origin_cells = ""
-        if show_origin_split:
+        commitment_cells = ""
+        if show_commitment_split:
             fresh = float(r.get("Fresh SP", 0))
-            cf = float(r.get("Carry-forward SP", 0))
-            origin_cells = (
+            cf_dev = float(r.get("CF Dev SP", 0))
+            cf_test = float(r.get("CF Test SP", 0))
+            commitment_cells = (
                 f'<td style="{td2};text-align:center;font-weight:600;color:#6366f1">{fresh:.1f}</td>'
-                f'<td style="{td2};text-align:center;font-weight:600;color:#f59e0b">{cf:.1f}</td>'
+                f'<td style="{td2};text-align:center;font-weight:600;color:#f59e0b">{cf_dev:.1f}</td>'
+                f'<td style="{td2};text-align:center;font-weight:600;color:#0891b2">{cf_test:.1f}</td>'
             )
 
         with st.container():
@@ -1606,9 +1752,9 @@ def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
     <tbody>
       <tr>
         <td style="{td2};font-weight:600;color:#0f172a">{_html.escape(str(r["Developer"]))}</td>
-        <td style="{td2};text-align:center;font-weight:700;font-size:15px;color:#6366f1">{committed:.1f}</td>
+        <td style="{td2};text-align:center;font-weight:700;font-size:17px;color:#6366f1">{committed:.1f}</td>
         <td style="{td2};text-align:center;color:#64748b">{int(r["Total Issues"])}</td>
-        {origin_cells}
+        {commitment_cells}
         <td style="{td2};text-align:center">{util_cell}</td>
       </tr>
     </tbody>
@@ -1623,9 +1769,10 @@ def render_sprint_planning_section(issues_df: pd.DataFrame, sprint_name: str,
 
 def render_sprint_execution_section(issues_df: pd.DataFrame, prev_sprint,
                                      prev_sprint_name, cf_count: int, fresh_count: int,
-                                     fresh_sp: float, cf_sp: float,
+                                     fresh_sp: float,
                                      jira_domain: str, divider_html: str):
     team, dev_df = compute_sprint_metrics(issues_df)
+    commitment_summary = _commitment_summary(issues_df)
 
     _section_header("Sprint Metrics", f"{team['total_issues']} issues · {team['active_devs']} developers")
     kpi_cols = st.columns(5)
@@ -1655,10 +1802,14 @@ def render_sprint_execution_section(issues_df: pd.DataFrame, prev_sprint,
     if prev_sprint and cf_count > 0:
         prev_label = prev_sprint_name or "previous sprint"
         _section_header("Sprint Composition", f"Fresh commitments vs carry-forward from {prev_label}")
-        comp_cols = st.columns(2)
+        comp_cols = st.columns(3)
         comp_cfg = [
-            ("Fresh Commitment", f"{fresh_sp:.1f} SP", f"{fresh_count} new issues",                    "#6366f1"),
-            ("Carry-forward",    f"{cf_sp:.1f} SP",    f"{cf_count} issues from {prev_label}", "#f59e0b"),
+            ("Fresh Commitment", f"{fresh_sp:.1f} SP",
+                f"{_issue_count_text(fresh_count)} new",                    "#6366f1"),
+            ("Carry-forward Dev", f"{commitment_summary['cf_dev_sp']:.1f} SP",
+                f"{_issue_count_text(commitment_summary['cf_dev_count'])} from {prev_label}", "#f59e0b"),
+            ("Carry-forward Test", f"{commitment_summary['cf_test_sp']:.1f} SP",
+                f"{_issue_count_text(commitment_summary['cf_test_count'])} in TEST", "#0891b2"),
         ]
         for col, (label, value, sublabel, accent) in zip(comp_cols, comp_cfg):
             with col:
@@ -1751,14 +1902,17 @@ def render_sprint_execution_section(issues_df: pd.DataFrame, prev_sprint,
         th3 = "padding:8px 12px;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.07em;text-align:left;border-bottom:1px solid #e2e8f0;white-space:nowrap"
         td3 = "padding:10px 12px;font-size:13px;color:#334155;border-bottom:1px solid #f1f5f9;vertical-align:middle"
 
-        show_origin = prev_sprint is not None
+        show_commitment = (prev_sprint is not None) and ("Commitment Bucket" in issues_df.columns)
         issue_rows = ""
         for _, r in display_df.iterrows():
             bg = _group_bg(r["Status Group"])
             sp_str = f"{r['Story Points']:.1f}" if r["Story Points"] > 0 else "—"
             link = f'<a href="{jira_base}{r["Key"]}" target="_blank" style="color:#6366f1;font-weight:600;text-decoration:none">{_html.escape(r["Key"])}</a>'
             summ = _html.escape(str(r["Summary"])[:90]) + ("…" if len(str(r["Summary"])) > 90 else "")
-            origin_cell = f'<td style="{td3}">{_origin_badge(r["Origin"])}</td>' if show_origin else ""
+            commitment_cell = (
+                f'<td style="{td3}">{_commitment_badge(r["Commitment Bucket"])}</td>'
+                if show_commitment else ""
+            )
             issue_rows += (
                 f'<tr style="background:{bg}">'
                 f'<td style="{td3};white-space:nowrap">{link}</td>'
@@ -1767,11 +1921,11 @@ def render_sprint_execution_section(issues_df: pd.DataFrame, prev_sprint,
                 f'<td style="{td3};text-align:center;font-weight:600;color:#4f46e5">{sp_str}</td>'
                 f'<td style="{td3};white-space:nowrap">{_html.escape(r["Status"])}</td>'
                 f'<td style="{td3}">{_group_badge(r["Status Group"])}</td>'
-                f'{origin_cell}'
+                f'{commitment_cell}'
                 f'</tr>'
             )
 
-        origin_header = f'<th style="{th3}">Origin</th>' if show_origin else ""
+        commitment_header = f'<th style="{th3}">Commitment</th>' if show_commitment else ""
         st.markdown(f"""
 <div style="background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;
             overflow:hidden;overflow-x:auto;box-shadow:0 1px 4px rgba(0,0,0,.06)">
@@ -1784,7 +1938,7 @@ def render_sprint_execution_section(issues_df: pd.DataFrame, prev_sprint,
         <th style="{th3};text-align:center">SP</th>
         <th style="{th3}">Status</th>
         <th style="{th3}">Group</th>
-        {origin_header}
+        {commitment_header}
       </tr>
     </thead>
     <tbody>{issue_rows}</tbody>
@@ -1904,19 +2058,52 @@ def render_sprint_view(jira_config: dict):
             days_text = "starts today"
             days_color = "#f59e0b"
 
-    # Load issues now (before rendering the hero card) so we can include
-    # summary stats inline. Stats are cheap to compute from the resulting df.
+    # Load and classify issues before rendering the hero so active/future sprint
+    # stats use developer-actionable commitment, not TEST carry-forward.
     with st.spinner(f"Loading issues for {sprint_name}…"):
         issues_df = load_sprint_issues(jira_domain, email, token, sprint_id)
 
+    prev_sprint_name = None
+    carry_forward_keys = set()
+    if not issues_df.empty:
+        # For a closed sprint, mid-sprint statuses (In Progress, Test, etc.) are
+        # misleading — those tickets were dropped to backlog unfinished. Collapse
+        # everything non-Done into a single "Not Delivered" bucket.
+        if sprint_state == "closed":
+            issues_df = issues_df.copy()
+            issues_df["Status Group"] = issues_df["Status Group"].apply(
+                lambda g: g if g == "Done" else "Not Delivered"
+            )
+
+        # Carry-forward detection: issues that also appeared in the previous sprint.
+        if prev_sprint:
+            prev_sprint_name = prev_sprint.get("name", "")
+            prev_df = load_sprint_issues(jira_domain, email, token, prev_sprint["id"])
+            if not prev_df.empty:
+                carry_forward_keys = set(prev_df["Key"]) & set(issues_df["Key"])
+
+        issues_df = add_commitment_classification(issues_df, carry_forward_keys)
+
+    commitment_summary = _commitment_summary(issues_df)
+
     if issues_df.empty:
         total_issues, active_devs_count, committed_sp_total = 0, 0, 0.0
+        hero_sp_label = "SP committed"
     else:
         total_issues = len(issues_df)
-        active_devs_count = sum(
-            1 for d in issues_df["Developer"].dropna().unique() if d != "(Unassigned)"
-        )
-        committed_sp_total = float(issues_df["Story Points"].sum())
+        if sprint_state == "closed":
+            active_devs_count = sum(
+                1 for d in issues_df["Developer"].dropna().unique() if d != "(Unassigned)"
+            )
+            committed_sp_total = float(issues_df["Story Points"].sum())
+            hero_sp_label = "SP in sprint"
+        else:
+            actionable_df = issues_df[issues_df["Is Actionable Commitment"]]
+            active_devs_count = sum(
+                1 for d in actionable_df["Developer"].dropna().unique() if d != "(Unassigned)"
+            )
+            committed_sp_total = commitment_summary["actionable_sp"]
+            hero_sp_label = "SP committed"
 
     # Hero card — three-row layout with a state-color left accent. Tabs follow
     # only when there's actual content to lens (not closed, not empty).
@@ -1940,7 +2127,7 @@ def render_sprint_view(jira_config: dict):
     dev_word = "dev" if active_devs_count == 1 else "devs"
     row3_html = (
         f'{total_issues} {issue_word} · {active_devs_count} {dev_word} · '
-        f'{committed_sp_total:.1f} SP committed'
+        f'{committed_sp_total:.1f} {hero_sp_label}'
     )
 
     meta_html = f'<div class="hero-meta">{row2_html}</div>' if row2_parts else ""
@@ -1963,31 +2150,9 @@ def render_sprint_view(jira_config: dict):
         st.info("No issues found for this sprint.")
         return
 
-    # For a closed sprint, mid-sprint statuses (In Progress, Test, etc.) are
-    # misleading — those tickets were dropped to backlog unfinished. Collapse
-    # everything non-Done into a single "Not Delivered" bucket.
-    if sprint_state == "closed":
-        issues_df = issues_df.copy()
-        issues_df["Status Group"] = issues_df["Status Group"].apply(
-            lambda g: g if g == "Done" else "Not Delivered"
-        )
-
-    # Carry-forward detection: issues that also appeared in the previous sprint
-    carry_forward_keys = set()
-    prev_sprint_name = None
-    if prev_sprint:
-        prev_sprint_name = prev_sprint.get("name", "")
-        prev_df = load_sprint_issues(jira_domain, email, token, prev_sprint["id"])
-        if not prev_df.empty:
-            carry_forward_keys = set(prev_df["Key"]) & set(issues_df["Key"])
-    issues_df = issues_df.copy()
-    issues_df["Origin"] = issues_df["Key"].apply(
-        lambda k: "Carry-forward" if k in carry_forward_keys else "New"
-    )
-    fresh_sp = float(issues_df[issues_df["Origin"] == "New"]["Story Points"].sum())
-    cf_sp = float(issues_df[issues_df["Origin"] == "Carry-forward"]["Story Points"].sum())
-    cf_count = int((issues_df["Origin"] == "Carry-forward").sum())
-    fresh_count = int((issues_df["Origin"] == "New").sum())
+    fresh_sp = commitment_summary["fresh_sp"]
+    cf_count = commitment_summary["cf_count"]
+    fresh_count = commitment_summary["fresh_count"]
 
     # Lens choice — Planning is meaningless for closed sprints, so the toggle
     # is hidden in that case and Execution renders directly. Active sprints
@@ -2006,7 +2171,7 @@ def render_sprint_view(jira_config: dict):
     else:
         render_sprint_execution_section(
             issues_df, prev_sprint, prev_sprint_name,
-            cf_count, fresh_count, fresh_sp, cf_sp, jira_domain, DIVIDER,
+            cf_count, fresh_count, fresh_sp, jira_domain, DIVIDER,
         )
 
 
